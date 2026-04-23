@@ -1,0 +1,16 @@
+# Local editor / OS noise
+.DS_Store
+
+# Local MCP config
+.mcp.json
+
+# Go build output
+/cc-nerf-buster
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Probe run outputs
+tools/capacity-probe/probe-runs/
+
