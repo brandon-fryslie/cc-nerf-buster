@@ -35,7 +35,11 @@ type Metrics struct {
 }
 
 type counterSet struct {
-	requests atomic.Int64
+	requests         atomic.Int64
+	inputTokens      atomic.Int64
+	outputTokens     atomic.Int64
+	cacheCreateInput atomic.Int64
+	cacheReadInput   atomic.Int64
 }
 
 type gaugeSet struct {
@@ -138,6 +142,12 @@ func (m *Metrics) Record(event *APIEvent) {
 
 	cs := m.getCounters(model, status, org, event.Upstream)
 	cs.requests.Add(1)
+	if event.Usage != nil {
+		cs.inputTokens.Add(event.Usage.InputTokens)
+		cs.outputTokens.Add(event.Usage.OutputTokens)
+		cs.cacheCreateInput.Add(event.Usage.CacheCreationInputTokens)
+		cs.cacheReadInput.Add(event.Usage.CacheReadInputTokens)
+	}
 
 	// Compute weighted cost for quota estimation
 	gs := m.getGauges(org, event.Upstream)
@@ -326,6 +336,34 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cs := m.counters[key]
 		labels := parseCounterKey(key)
 		b.WriteString(fmt.Sprintf("ccnb_requests_total{%s} %d\n", labels, cs.requests.Load()))
+	}
+
+	writeCounterHelp(&b, "ccnb_input_tokens_total", "Total input tokens observed", "counter")
+	for _, key := range counterKeys {
+		cs := m.counters[key]
+		labels := parseCounterKey(key)
+		b.WriteString(fmt.Sprintf("ccnb_input_tokens_total{%s} %d\n", labels, cs.inputTokens.Load()))
+	}
+
+	writeCounterHelp(&b, "ccnb_output_tokens_total", "Total output tokens observed", "counter")
+	for _, key := range counterKeys {
+		cs := m.counters[key]
+		labels := parseCounterKey(key)
+		b.WriteString(fmt.Sprintf("ccnb_output_tokens_total{%s} %d\n", labels, cs.outputTokens.Load()))
+	}
+
+	writeCounterHelp(&b, "ccnb_cache_creation_input_tokens_total", "Total cache creation input tokens observed", "counter")
+	for _, key := range counterKeys {
+		cs := m.counters[key]
+		labels := parseCounterKey(key)
+		b.WriteString(fmt.Sprintf("ccnb_cache_creation_input_tokens_total{%s} %d\n", labels, cs.cacheCreateInput.Load()))
+	}
+
+	writeCounterHelp(&b, "ccnb_cache_read_input_tokens_total", "Total cache read input tokens observed", "counter")
+	for _, key := range counterKeys {
+		cs := m.counters[key]
+		labels := parseCounterKey(key)
+		b.WriteString(fmt.Sprintf("ccnb_cache_read_input_tokens_total{%s} %d\n", labels, cs.cacheReadInput.Load()))
 	}
 
 	// Log errors

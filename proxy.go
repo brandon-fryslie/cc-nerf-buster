@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -10,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -305,6 +309,46 @@ func transfer(dst, src net.Conn) {
 	io.Copy(dst, src)
 }
 
+func isMeasuredAnthropicRequest(method, path string) bool {
+	return method == http.MethodPost && path == "/v1/messages"
+}
+
+func copyHeaders(dst, src http.Header) {
+	for key, vals := range src {
+		for _, val := range vals {
+			dst.Add(key, val)
+		}
+	}
+}
+
+func dumpFailedMeasuredSSE(dataDir string, capture []byte) {
+	path := filepath.Join(dataDir, "last_stream_incomplete.sse")
+	if err := os.WriteFile(path, capture, 0644); err != nil {
+		throttledLog("stream_incomplete_dump", "failed to write %s: %v", path, err)
+	}
+}
+
+func decodeMeasuredSSECapture(capture []byte) ([]byte, error) {
+	if len(capture) < 2 || capture[0] != 0x1f || capture[1] != 0x8b {
+		return capture, nil
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(capture))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	return io.ReadAll(zr)
+}
+
+func measuredUpstreamContext(ctx context.Context) context.Context {
+	// [LAW:single-enforcer] the proxy owns cancellation policy for measured
+	// upstream requests so downstream client disconnects do not truncate the
+	// canonical usage event before Anthropic emits final usage.
+	return context.WithoutCancel(ctx)
+}
+
 // forwardWithCapture handles plain HTTP requests to captured upstream hosts.
 // It upgrades the connection to HTTPS upstream and extracts usage data.
 func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +357,13 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 	hostOnly := upstreamHost
 	if idx := strings.LastIndex(hostOnly, ":"); idx != -1 {
 		hostOnly = hostOnly[:idx]
+	}
+
+	if !isMeasuredAnthropicRequest(r.Method, r.URL.Path) {
+		// [LAW:single-enforcer] measurement is gated at the proxy boundary so
+		// non-billable Anthropic requests do not leak into quota accounting.
+		p.forwardCapturedPassthrough(w, r, upstreamHost)
+		return
 	}
 
 	var errors []string
@@ -340,18 +391,13 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 		upstreamURL += "?" + r.URL.RawQuery
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, reqBody)
+	upstreamReq, err := http.NewRequestWithContext(measuredUpstreamContext(r.Context()), r.Method, upstreamURL, reqBody)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	// Copy headers
-	for key, vals := range r.Header {
-		for _, val := range vals {
-			upstreamReq.Header.Add(key, val)
-		}
-	}
+	copyHeaders(upstreamReq.Header, r.Header)
 
 	resp, err := p.captureTransport.RoundTrip(upstreamReq)
 	if err != nil {
@@ -380,12 +426,7 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 
 	isStreaming := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
-	// Copy response headers to client
-	for key, vals := range resp.Header {
-		for _, val := range vals {
-			w.Header().Add(key, val)
-		}
-	}
+	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
 	// Stream body to client while extracting usage
@@ -437,41 +478,78 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (p *Proxy) forwardCapturedPassthrough(w http.ResponseWriter, r *http.Request, upstreamHost string) {
+	upstreamURL := "https://" + upstreamHost + r.URL.Path
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, r.Body)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	copyHeaders(upstreamReq.Header, r.Header)
+
+	resp, err := p.captureTransport.RoundTrip(upstreamReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
 // streamSSEWithCapture pipes an SSE stream to the client while extracting usage.
 func (p *Proxy) streamSSEWithCapture(w http.ResponseWriter, body io.Reader) (*Usage, error) {
-	pr, pw := io.Pipe()
-
-	usageCh := make(chan usageResult, 1)
-	go func() {
-		u, err := extractUsageFromSSE(pr)
-		usageCh <- usageResult{Usage: u, Err: err}
-	}()
-
-	// TeeReader: everything read from body goes to both w and pw
-	tee := io.TeeReader(body, pw)
-
 	flusher, canFlush := w.(http.Flusher)
+	var downstreamWriteErr error
+	const maxCapture = 10 * 1024 * 1024
+	var capture bytes.Buffer
 
 	buf := make([]byte, 32*1024)
 	for {
-		n, readErr := tee.Read(buf)
+		n, readErr := body.Read(buf)
 		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				pw.Close()
-				result := <-usageCh
-				return result.Usage, writeErr
+			if capture.Len()+n <= maxCapture {
+				capture.Write(buf[:n])
 			}
-			if canFlush {
+			// [LAW:dataflow-not-control-flow] keep draining the upstream stream in
+			// the same order even if the downstream client stops reading so usage
+			// extraction still sees the full response and remains measurable.
+			if downstreamWriteErr == nil {
+				if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+					downstreamWriteErr = writeErr
+				}
+			}
+			if downstreamWriteErr == nil && canFlush {
 				flusher.Flush()
 			}
 		}
 		if readErr != nil {
-			pw.Close()
-			result := <-usageCh
-			if readErr != io.EOF {
-				return result.Usage, readErr
+			if capture.Len() > maxCapture {
+				return nil, fmt.Errorf("stream exceeded %d bytes", maxCapture)
 			}
-			return result.Usage, result.Err
+			decoded, decodeErr := decodeMeasuredSSECapture(capture.Bytes())
+			if decodeErr != nil {
+				dumpFailedMeasuredSSE(p.metrics.dataDir, capture.Bytes())
+				return nil, fmt.Errorf("decode stream capture: %w", decodeErr)
+			}
+			usage, err := extractUsageFromSSE(bytes.NewReader(decoded))
+			if err == nil {
+				return usage, nil
+			}
+			if capture.Len() > 0 {
+				dumpFailedMeasuredSSE(p.metrics.dataDir, capture.Bytes())
+			}
+			if readErr != io.EOF {
+				return nil, fmt.Errorf("stream read: %w", readErr)
+			}
+			return usage, err
 		}
 	}
 }

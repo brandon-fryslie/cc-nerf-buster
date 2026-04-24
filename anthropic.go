@@ -109,6 +109,10 @@ func extractQuota(h http.Header) *QuotaInfo {
 	return q
 }
 
+func canonicalModelID(model string) string {
+	return strings.TrimSpace(model)
+}
+
 // extractMeta reads request metadata headers from the response.
 func extractMeta(h http.Header) *RequestMeta {
 	m := &RequestMeta{
@@ -141,7 +145,8 @@ func extractModelFromRequest(body io.ReadCloser) (io.ReadCloser, *string, error)
 
 	var model *string
 	if req.Model != "" {
-		model = &req.Model
+		canonical := canonicalModelID(req.Model)
+		model = &canonical
 	}
 	return io.NopCloser(strings.NewReader(string(data))), model, nil
 }
@@ -164,7 +169,7 @@ const (
 // RequestCost computes the weighted cost of a request in API-dollar-equivalent units.
 // Returns (cost, true) for known models, or (0, false) for unknown models.
 func RequestCost(model string, u *Usage) (float64, bool) {
-	p, ok := modelPricing[model]
+	p, ok := modelPricing[canonicalModelID(model)]
 	if !ok {
 		return 0, false
 	}
@@ -179,6 +184,11 @@ func RequestCost(model string, u *Usage) (float64, bool) {
 type usageResult struct {
 	Usage *Usage
 	Err   error
+}
+
+type sseEvent struct {
+	Event string
+	Data  string
 }
 
 // extractUsageFromBody parses usage from a non-streaming JSON response body.
@@ -196,60 +206,172 @@ func extractUsageFromBody(data []byte) (*Usage, error) {
 // extractUsageFromSSE scans an SSE stream for usage data.
 // Reads from r until EOF. Returns the best usage data found.
 func extractUsageFromSSE(r io.Reader) (*Usage, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
 	var (
-		eventType string
-		usage     Usage
-		found     bool
+		usage Usage
+		found bool
 	)
 
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if strings.HasPrefix(line, "event: ") {
-			eventType = strings.TrimPrefix(line, "event: ")
+	for _, event := range readSSEEvents(r) {
+		if event.Event != "message_start" && event.Event != "message_delta" {
 			continue
 		}
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		if eventType != "message_start" && eventType != "message_delta" {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
-
-		switch eventType {
-		case "message_start":
-			var msg struct {
-				Message struct {
-					Usage *Usage `json:"usage"`
-				} `json:"message"`
-			}
-			if err := json.Unmarshal([]byte(data), &msg); err == nil && msg.Message.Usage != nil {
-				usage.InputTokens = msg.Message.Usage.InputTokens
-				usage.CacheCreationInputTokens = msg.Message.Usage.CacheCreationInputTokens
-				usage.CacheReadInputTokens = msg.Message.Usage.CacheReadInputTokens
-				found = true
-			}
-
-		case "message_delta":
-			var msg struct {
-				Usage *Usage `json:"usage"`
-			}
-			if err := json.Unmarshal([]byte(data), &msg); err == nil && msg.Usage != nil {
-				usage.OutputTokens = msg.Usage.OutputTokens
-				found = true
-			}
+		if eventUsage, ok := extractUsageFromEventData(event.Data); ok {
+			usage = mergeUsage(usage, eventUsage)
+			found = true
 		}
 	}
 
 	if !found {
 		return nil, fmt.Errorf("no usage events found in SSE stream")
 	}
-	return &usage, scanner.Err()
+	return &usage, nil
+}
+
+func mergeUsage(base Usage, next Usage) Usage {
+	if next.InputTokens != 0 {
+		base.InputTokens = next.InputTokens
+	}
+	if next.OutputTokens != 0 {
+		base.OutputTokens = next.OutputTokens
+	}
+	if next.CacheCreationInputTokens != 0 {
+		base.CacheCreationInputTokens = next.CacheCreationInputTokens
+	}
+	if next.CacheReadInputTokens != 0 {
+		base.CacheReadInputTokens = next.CacheReadInputTokens
+	}
+	return base
+}
+
+func extractUsageFromEventData(data string) (Usage, bool) {
+	var payload any
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return Usage{}, false
+	}
+	return findUsageValue(payload)
+}
+
+func findUsageValue(v any) (Usage, bool) {
+	switch typed := v.(type) {
+	case map[string]any:
+		if rawUsage, ok := typed["usage"]; ok {
+			if usage, ok := usageFromMap(rawUsage); ok {
+				return usage, true
+			}
+		}
+		for _, child := range typed {
+			if usage, ok := findUsageValue(child); ok {
+				return usage, true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if usage, ok := findUsageValue(child); ok {
+				return usage, true
+			}
+		}
+	}
+	return Usage{}, false
+}
+
+func usageFromMap(v any) (Usage, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return Usage{}, false
+	}
+	return Usage{
+		InputTokens:              int64FromJSON(m["input_tokens"]),
+		OutputTokens:             int64FromJSON(m["output_tokens"]),
+		CacheCreationInputTokens: int64FromJSON(m["cache_creation_input_tokens"]),
+		CacheReadInputTokens:     int64FromJSON(m["cache_read_input_tokens"]),
+	}, true
+}
+
+func int64FromJSON(v any) int64 {
+	switch typed := v.(type) {
+	case float64:
+		return int64(typed)
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	default:
+		return 0
+	}
+}
+
+// [LAW:single-enforcer] SSE framing is parsed in one place so usage extraction
+// does not duplicate line/event boundary logic across call sites.
+func readSSEEvents(r io.Reader) []sseEvent {
+	br := bufio.NewReader(r)
+	var (
+		events    []sseEvent
+		eventType string
+		dataLines []string
+	)
+
+	flush := func() {
+		if len(dataLines) == 0 {
+			eventType = ""
+			return
+		}
+		events = append(events, sseEvent{
+			Event: eventType,
+			Data:  strings.Join(dataLines, "\n"),
+		})
+		eventType = ""
+		dataLines = nil
+	}
+
+	for {
+		line, eof, err := readSSELine(br)
+		if err != nil {
+			break
+		}
+
+		if line == "" {
+			flush()
+		} else if strings.HasPrefix(line, ":") {
+			// Comment line; ignore.
+		} else if strings.HasPrefix(line, "event:") {
+			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		} else if strings.HasPrefix(line, "data:") {
+			data := strings.TrimPrefix(line, "data:")
+			if strings.HasPrefix(data, " ") {
+				data = data[1:]
+			}
+			dataLines = append(dataLines, data)
+		}
+
+		if eof {
+			flush()
+			break
+		}
+	}
+
+	return events
+}
+
+func readSSELine(br *bufio.Reader) (line string, eof bool, err error) {
+	var (
+		fragments []byte
+		prefix    bool
+	)
+
+	for {
+		part, isPrefix, readErr := br.ReadLine()
+		fragments = append(fragments, part...)
+		prefix = isPrefix
+
+		switch {
+		case readErr == io.EOF:
+			return string(fragments), true, nil
+		case readErr != nil:
+			return "", false, readErr
+		case prefix:
+			continue
+		default:
+			return string(fragments), false, nil
+		}
+	}
 }

@@ -68,9 +68,12 @@ func (w *JSONLWriter) Write(event *APIEvent) {
 		throttledLog("jsonl_write", "failed to write event: %v", err)
 		return
 	}
-
-	if w.buf.Buffered() >= 4096 {
-		w.buf.Flush()
+	// [LAW:one-source-of-truth] usage.jsonl is the canonical measurement
+	// artifact, so each event is flushed immediately and cannot drift behind
+	// the in-memory metrics view during a probe run.
+	if err := w.buf.Flush(); err != nil {
+		w.metrics.IncLogErrors()
+		throttledLog("jsonl_flush", "failed to flush event: %v", err)
 	}
 }
 
