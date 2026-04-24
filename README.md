@@ -18,6 +18,8 @@ Normal usage is one command:
 just probe
 ```
 
+Warning: do not use the same Claude account for anything else while the probe is running. If other tracked or untracked usage happens at the same time, the quota utilization numbers will include both and the resulting bounds will be wrong.
+
 When it exits, it already prints:
 
 - the active org/upstream scope
