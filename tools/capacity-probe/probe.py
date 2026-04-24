@@ -121,35 +121,97 @@ def parse_gauge(metrics_text: str, name: str) -> float:
     die(f"metric {name} not found")
 
 
-def parse_model_counter_total(metrics_text: str, metric_name: str, model: str) -> int:
-    prefix = f'{metric_name}{{model="{model}",'
-    total = 0
+def parse_metric_line(line: str) -> tuple[str, dict[str, str], float] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    head, sep, value_text = line.rpartition(" ")
+    if not sep:
+        return None
+    try:
+        value = float(value_text)
+    except ValueError:
+        return None
+    if "{" not in head:
+        return head, {}, value
+    name, _, labels_text = head.partition("{")
+    labels_text = labels_text.removesuffix("}")
+    labels: dict[str, str] = {}
+    for item in labels_text.split(","):
+        key, _, raw_value = item.partition("=")
+        labels[key] = raw_value.strip('"')
+    return name, labels, value
+
+
+def matching_series(metrics_text: str, metric_name: str, required_labels: dict[str, str]) -> list[tuple[dict[str, str], float]]:
+    matches: list[tuple[dict[str, str], float]] = []
     for line in metrics_text.splitlines():
-        if line.startswith(prefix):
-            total += int(float(line.rsplit(" ", 1)[-1]))
+        parsed = parse_metric_line(line)
+        if parsed is None:
+            continue
+        name, labels, value = parsed
+        if name != metric_name:
+            continue
+        if all(labels.get(key) == expected for key, expected in required_labels.items()):
+            matches.append((labels, value))
+    return matches
+
+
+def canonical_metric_scope(metrics_text: str, model: str) -> dict[str, str]:
+    series = matching_series(metrics_text, "ccnb_requests_total", {"model": model})
+    if not series:
+        die(f"metric ccnb_requests_total for model {model} not found")
+    # [LAW:one-source-of-truth] the active model request series defines the
+    # org/upstream identity for the rest of the probe's metrics snapshot.
+    labels, _value = max(series, key=lambda item: item[1])
+    scope = {key: labels[key] for key in ("org", "upstream") if key in labels}
+    if len(scope) != 2:
+        die(f"unable to resolve canonical org/upstream scope for model {model}")
+    return scope
+
+
+def parse_scoped_counter_total(
+    metrics_text: str,
+    metric_name: str,
+    required_labels: dict[str, str],
+) -> int:
+    total = 0
+    for _labels, value in matching_series(metrics_text, metric_name, required_labels):
+        total += int(value)
     return total
+
+
+def parse_scoped_gauge(metrics_text: str, metric_name: str, required_labels: dict[str, str]) -> float:
+    series = matching_series(metrics_text, metric_name, required_labels)
+    if not series:
+        die(f"metric {metric_name} with labels {required_labels} not found")
+    return series[0][1]
 
 
 def snapshot_metrics(run_dir: Path, metrics_url: str, label: str, model: str) -> dict:
     raw_text = fetch_metrics(metrics_url)
     raw_path = run_dir / "raw-metrics" / f"{label}.prom"
     raw_path.write_text(raw_text)
+    scope = canonical_metric_scope(raw_text, model)
+    model_scope = {"model": model, **scope}
 
     snap = {
         "label": label,
         "ts": utc_now(),
-        "util_5h": parse_gauge(raw_text, "ccnb_quota_5h_utilization"),
-        "util_7d": parse_gauge(raw_text, "ccnb_quota_7d_utilization"),
-        "cost_total": parse_gauge(raw_text, "ccnb_cost_total"),
-        "capacity_usd_5h": parse_gauge(raw_text, "ccnb_quota_5h_estimated_capacity_usd"),
-        "capacity_usd_7d": parse_gauge(raw_text, "ccnb_quota_7d_estimated_capacity_usd"),
+        "org": scope["org"],
+        "upstream": scope["upstream"],
+        "util_5h": parse_scoped_gauge(raw_text, "ccnb_quota_5h_utilization", scope),
+        "util_7d": parse_scoped_gauge(raw_text, "ccnb_quota_7d_utilization", scope),
+        "cost_total": parse_scoped_gauge(raw_text, "ccnb_cost_total", scope),
+        "capacity_usd_5h": parse_scoped_gauge(raw_text, "ccnb_quota_5h_estimated_capacity_usd", scope),
+        "capacity_usd_7d": parse_scoped_gauge(raw_text, "ccnb_quota_7d_estimated_capacity_usd", scope),
         "no_model_input_tokens": parse_gauge(raw_text, "ccnb_no_model_error_input_tokens_total"),
         "no_model_output_tokens": parse_gauge(raw_text, "ccnb_no_model_error_output_tokens_total"),
-        "model_requests": parse_model_counter_total(raw_text, "ccnb_requests_total", model),
-        "model_input_tokens": parse_model_counter_total(raw_text, "ccnb_input_tokens_total", model),
-        "model_output_tokens": parse_model_counter_total(raw_text, "ccnb_output_tokens_total", model),
-        "model_cache_creation_input_tokens": parse_model_counter_total(raw_text, "ccnb_cache_creation_input_tokens_total", model),
-        "model_cache_read_input_tokens": parse_model_counter_total(raw_text, "ccnb_cache_read_input_tokens_total", model),
+        "model_requests": parse_scoped_counter_total(raw_text, "ccnb_requests_total", model_scope),
+        "model_input_tokens": parse_scoped_counter_total(raw_text, "ccnb_input_tokens_total", model_scope),
+        "model_output_tokens": parse_scoped_counter_total(raw_text, "ccnb_output_tokens_total", model_scope),
+        "model_cache_creation_input_tokens": parse_scoped_counter_total(raw_text, "ccnb_cache_creation_input_tokens_total", model_scope),
+        "model_cache_read_input_tokens": parse_scoped_counter_total(raw_text, "ccnb_cache_read_input_tokens_total", model_scope),
     }
     with (run_dir / "snapshots.jsonl").open("a") as f:
         f.write(json.dumps(snap) + "\n")
