@@ -12,39 +12,27 @@ just vet
 
 ## Capacity-Probe Workflow
 
-The capacity probe sends normal Claude requests through the proxy and measures:
+The normal workflow is:
 
-- token deltas from proxy counters
-- quota utilization bucket changes
-- low / midpoint / high quota bounds when a tick is bracketed
+```bash
+just probe
+```
 
-Run a probe:
+When `just probe` exits, it already:
+
+- regenerates the derived report artifacts for that run
+- prints the active org/upstream scope
+- prints 5h and 7d low / midpoint / high bounds
+- prints pinned-model full-quota and per-1%-tick token projections
+
+If you only want one window, use:
 
 ```bash
 just probe-5h
 just probe-7d
-just probe
 ```
 
-Resume the most recent matching run:
-
-```bash
-just probe-5h --continue
-just probe-7d --continue
-just probe --continue
-```
-
-Recompute report artifacts for an existing run:
-
-```bash
-just probe-report /absolute/path/to/run
-```
-
-Print the machine-readable low / midpoint / high bounds for an existing run:
-
-```bash
-just probe-bounds /absolute/path/to/run
-```
+If you interrupt the probe, it finishes the current iteration, prints the same bounds summary, and then prints the resume command. Use that resume command directly.
 
 ## Bounds Workflow
 
@@ -76,6 +64,12 @@ The canonical raw inputs remain:
 
 Everything else is derived from those files.
 
+The three numbers mean:
+
+- `low` / `pre-pre`: systematic lower bound
+- `midpoint`: recommended estimate
+- `high` / `post-post`: systematic upper bound
+
 ## Probe Run Artifacts
 
 Each run directory contains:
@@ -90,6 +84,30 @@ Each run directory contains:
 - `measured_ticks.jsonl`: clean measured ticks with `pre`, `midpoint`, and `post`
 - `bounds.json`: machine-readable low / midpoint / high bounds
 - `report.md`: human-readable summary
+
+## Advanced / Rebuild Artifacts
+
+These commands are for rebuilding or inspecting an existing run. They are not part of the normal operator path.
+
+Resume the most recent matching run:
+
+```bash
+just probe --continue
+just probe-5h --continue
+just probe-7d --continue
+```
+
+Recompute report artifacts for an existing run:
+
+```bash
+just probe-report /absolute/path/to/run
+```
+
+Print the low / midpoint / high bounds for an existing run:
+
+```bash
+just probe-bounds /absolute/path/to/run
+```
 
 ## Interpreting Token Counts
 

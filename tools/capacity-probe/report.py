@@ -37,6 +37,8 @@ PRICING = {
 
 
 def load_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
@@ -203,13 +205,38 @@ def render_bounds_summary(bounds: dict, pinned_model_family: str) -> list[str]:
     return lines
 
 
+def render_probe_exit_summary(bounds: dict, pinned_model_family: str) -> list[str]:
+    lines = [
+        "Probe summary:",
+        f"  run dir: {bounds['run_dir']}",
+        f"  scope: org={bounds['org']} upstream={bounds['upstream']}",
+        f"  model: {bounds['model']}",
+    ]
+    for window in ("5h", "7d"):
+        summary = bounds["windows"][window]
+        weighted = summary["weighted_usd"]
+        lines.append(f"  {window} bounds:")
+        if weighted["midpoint"] is None:
+            lines.append("    low=unavailable midpoint=unavailable high=unavailable")
+            lines.append(f"    proxy_lifetime_estimate={weighted['selected']:.6f} weighted-USD")
+        else:
+            tokens = summary["tokens"]["midpoint"][pinned_model_family]
+            lines.append(
+                f"    low={weighted['low_pre']:.6f} midpoint={weighted['midpoint']:.6f} high={weighted['high_post']:.6f} weighted-USD"
+            )
+            lines.append(
+                f"    {pinned_model_family}_input_tokens full_quota={fmt_tokens(tokens['input_full_quota'])} per_1pct_tick={fmt_tokens(tokens['input_per_tick'])}"
+            )
+    return lines
+
+
 def main(run_dir: Path, print_bounds: bool) -> None:
     snaps = load_jsonl(run_dir / "snapshots.jsonl")
     iters = load_jsonl(run_dir / "iterations.jsonl")
     manifest = json.loads((run_dir / "manifest.json").read_text())
 
-    if len(snaps) < 2:
-        raise SystemExit("report.py: need at least 2 snapshots")
+    if not snaps:
+        raise SystemExit("report.py: need at least 1 snapshot")
 
     crossings_5h = detect_boundaries(snaps, "util_5h")
     crossings_7d = detect_boundaries(snaps, "util_7d")
@@ -387,6 +414,8 @@ def main(run_dir: Path, print_bounds: bool) -> None:
 
     (run_dir / "report.md").write_text("\n".join(lines))
     if print_bounds:
+        for line in render_probe_exit_summary(bounds, pinned_model_family):
+            print(line)
         for window in ("5h", "7d"):
             for line in render_bounds_summary(bounds["windows"][window], pinned_model_family):
                 print(line)
