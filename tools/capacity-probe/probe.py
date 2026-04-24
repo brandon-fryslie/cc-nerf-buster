@@ -323,6 +323,13 @@ def resume_command_for_run(window: str, run_dir: Path | None) -> str:
     return f"just {recipe} --resume {run_dir}"
 
 
+def run_report(script_dir: Path, run_dir: Path) -> None:
+    subprocess.run(
+        [sys.executable, str(script_dir / "report.py"), "--print-bounds", str(run_dir)],
+        check=True,
+    )
+
+
 def copy_with_hashes(run_dir: Path, script_dir: Path) -> None:
     copied = [
         Path(__file__),
@@ -556,7 +563,7 @@ def main() -> None:
             f"7d {ticks_7d}/{need_7d}"
         )
         log("running report.py")
-        subprocess.run([sys.executable, str(script_dir / "report.py"), str(run_dir)], check=True)
+        run_report(script_dir, run_dir)
         log(f"run complete: {run_dir}")
         print(run_dir)
         return
@@ -636,6 +643,8 @@ def main() -> None:
             used_units_since_7d_tick = max(0.0, used_units_since_7d_tick - est_units_per_tick_7d * crossed_7d)
 
         if interrupted:
+            log("running report.py")
+            run_report(script_dir, run_dir)
             log(f"resume with: {resume_command_for_run(args.window, run_dir)}")
             return
 
@@ -706,11 +715,13 @@ def main() -> None:
             break
 
     if interrupted:
+        log("running report.py")
+        run_report(script_dir, run_dir)
         log(f"resume with: {resume_command_for_run(args.window, run_dir)}")
         return
 
     log("running report.py")
-    subprocess.run([sys.executable, str(script_dir / "report.py"), str(run_dir)], check=True)
+    run_report(script_dir, run_dir)
 
     log(f"run complete: {run_dir}")
     print(run_dir)

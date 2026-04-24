@@ -5,6 +5,7 @@ report.py — post-run analysis for capacity-probe.
 Reads snapshots.jsonl + iterations.jsonl + manifest.json from a run directory
 and produces:
   - deltas.jsonl   — one row per observed tick crossing (5h or 7d)
+  - bounds.json    — machine-readable low/mid/high quota bounds
   - report.md      — human-readable summary with capacity expressed as tokens
 
 Pure stdlib. No external deps. Deterministic — regenerating from the same
@@ -21,6 +22,7 @@ in metrics.go (writeTokenCapacity was removed; the report does it client-side).
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -133,7 +135,75 @@ def fmt_tokens(n: int) -> str:
     return f"{n:,}"
 
 
-def main(run_dir: Path) -> None:
+def avg_capacity(ticks: list[dict], key: str) -> float | None:
+    if not ticks:
+        return None
+    return sum(t[key] for t in ticks) / len(ticks)
+
+
+def token_projection(capacity_usd: float) -> dict[str, dict[str, int]]:
+    return {
+        model: {
+            "input_full_quota": tokens_from_usd(capacity_usd, pricing["input"]),
+            "input_per_tick": tokens_from_usd(capacity_usd * 0.01, pricing["input"]),
+            "output_full_quota": tokens_from_usd(capacity_usd, pricing["output"]),
+            "output_per_tick": tokens_from_usd(capacity_usd * 0.01, pricing["output"]),
+        }
+        for model, pricing in PRICING.items()
+    }
+
+
+def build_bounds_summary(window: str, ticks: list[dict], proxy_capacity_usd: float) -> dict:
+    low_pre = avg_capacity(ticks, "cap_pre_usd")
+    midpoint = avg_capacity(ticks, "cap_midpoint_usd")
+    high_post = avg_capacity(ticks, "cap_post_usd")
+    bounded = low_pre is not None and midpoint is not None and high_post is not None
+    selected = midpoint if midpoint is not None else proxy_capacity_usd
+    # // [LAW:one-source-of-truth] bounds.json is the canonical derived summary
+    # for quota bounds; report.md and CLI output are rendered from the same data.
+    return {
+        "window": window,
+        "clean_measured_ticks": len(ticks),
+        "proxy_lifetime_capacity_usd": proxy_capacity_usd,
+        "weighted_usd": {
+            "low_pre": low_pre,
+            "midpoint": midpoint,
+            "high_post": high_post,
+            "selected": selected,
+        },
+        "tokens": None if not bounded else {
+            "low_pre": token_projection(low_pre),
+            "midpoint": token_projection(midpoint),
+            "high_post": token_projection(high_post),
+        },
+    }
+
+
+def render_bounds_summary(bounds: dict, pinned_model_family: str) -> list[str]:
+    weighted = bounds["weighted_usd"]
+    lines = [
+        f"{bounds['window']} bounds:",
+        f"  clean measured ticks: {bounds['clean_measured_ticks']}",
+    ]
+    if weighted["midpoint"] is None:
+        lines.append("  measured bounds: unavailable (no clean measured ticks)")
+        lines.append(f"  proxy lifetime estimate: {weighted['selected']:.6f} weighted-USD")
+        return lines
+
+    model_tokens = bounds["tokens"]["midpoint"][pinned_model_family]
+    low_tokens = bounds["tokens"]["low_pre"][pinned_model_family]
+    high_tokens = bounds["tokens"]["high_post"][pinned_model_family]
+    lines.extend(
+        [
+            f"  weighted-USD: low={weighted['low_pre']:.6f} mid={weighted['midpoint']:.6f} high={weighted['high_post']:.6f}",
+            f"  {pinned_model_family} input tokens: low={fmt_tokens(low_tokens['input_full_quota'])} mid={fmt_tokens(model_tokens['input_full_quota'])} high={fmt_tokens(high_tokens['input_full_quota'])}",
+            f"  {pinned_model_family} input tokens / 1% tick: low={fmt_tokens(low_tokens['input_per_tick'])} mid={fmt_tokens(model_tokens['input_per_tick'])} high={fmt_tokens(high_tokens['input_per_tick'])}",
+        ]
+    )
+    return lines
+
+
+def main(run_dir: Path, print_bounds: bool) -> None:
     snaps = load_jsonl(run_dir / "snapshots.jsonl")
     iters = load_jsonl(run_dir / "iterations.jsonl")
     manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -164,18 +234,24 @@ def main(run_dir: Path) -> None:
     proxy_cap_5h = last["capacity_usd_5h"]
     proxy_cap_7d = last["capacity_usd_7d"]
 
-    # Probe-derived capacity (only uses this run's measured ticks)
-    def _probe_cap(ticks: list[dict], key: str) -> float | None:
-        if not ticks:
-            return None
-        return sum(t[key] for t in ticks) / len(ticks)
-
-    probe_cap_5h_mid  = _probe_cap(ticks_5h, "cap_midpoint_usd")
-    probe_cap_5h_post = _probe_cap(ticks_5h, "cap_post_usd")
-    probe_cap_5h_pre  = _probe_cap(ticks_5h, "cap_pre_usd")
-    probe_cap_7d_mid  = _probe_cap(ticks_7d, "cap_midpoint_usd")
-    probe_cap_7d_post = _probe_cap(ticks_7d, "cap_post_usd")
-    probe_cap_7d_pre  = _probe_cap(ticks_7d, "cap_pre_usd")
+    probe_cap_5h_mid  = avg_capacity(ticks_5h, "cap_midpoint_usd")
+    probe_cap_5h_post = avg_capacity(ticks_5h, "cap_post_usd")
+    probe_cap_5h_pre  = avg_capacity(ticks_5h, "cap_pre_usd")
+    probe_cap_7d_mid  = avg_capacity(ticks_7d, "cap_midpoint_usd")
+    probe_cap_7d_post = avg_capacity(ticks_7d, "cap_post_usd")
+    probe_cap_7d_pre  = avg_capacity(ticks_7d, "cap_pre_usd")
+    pinned_model_family = "opus" if "opus" in manifest["model"].lower() else "sonnet" if "sonnet" in manifest["model"].lower() else "haiku"
+    bounds = {
+        "run_dir": str(run_dir),
+        "model": manifest["model"],
+        "org": first.get("org"),
+        "upstream": first.get("upstream"),
+        "windows": {
+            "5h": build_bounds_summary("5h", ticks_5h, proxy_cap_5h),
+            "7d": build_bounds_summary("7d", ticks_7d, proxy_cap_7d),
+        },
+    }
+    (run_dir / "bounds.json").write_text(json.dumps(bounds, indent=2) + "\n")
 
     lines: list[str] = []
     push = lines.append
@@ -231,6 +307,28 @@ def main(run_dir: Path) -> None:
             cell = f"{val:.6f}" if val is not None else "—"
             push(f"| {label} | {method:<10} | {cell:>23} | {n:>7} |")
     push("")
+    push("### Bounds")
+    push("")
+    push("Low = pre-pre, midpoint = recommended, high = post-post.")
+    push("")
+    for window in ("5h", "7d"):
+        summary = bounds["windows"][window]
+        weighted = summary["weighted_usd"]
+        push(f"#### {window}")
+        push("")
+        if weighted["midpoint"] is None:
+            push("_(no clean measured ticks in this run — only the proxy lifetime estimate is available)_")
+            push("")
+            continue
+        pinned_mid = summary["tokens"]["midpoint"][pinned_model_family]
+        pinned_low = summary["tokens"]["low_pre"][pinned_model_family]
+        pinned_high = summary["tokens"]["high_post"][pinned_model_family]
+        push("| Bound | Weighted-USD | Input tokens (full quota) | Input tokens / 1% tick |")
+        push("|-------|--------------|---------------------------|------------------------|")
+        push(f"| Low   | {weighted['low_pre']:.6f} | {fmt_tokens(pinned_low['input_full_quota'])} | {fmt_tokens(pinned_low['input_per_tick'])} |")
+        push(f"| Mid   | {weighted['midpoint']:.6f} | {fmt_tokens(pinned_mid['input_full_quota'])} | {fmt_tokens(pinned_mid['input_per_tick'])} |")
+        push(f"| High  | {weighted['high_post']:.6f} | {fmt_tokens(pinned_high['input_full_quota'])} | {fmt_tokens(pinned_high['input_per_tick'])} |")
+        push("")
     push("### Capacity as tokens (midpoint estimate, this run)")
     push("")
     for label, mid in [("5h", probe_cap_5h_mid), ("7d", probe_cap_7d_mid)]:
@@ -278,6 +376,7 @@ def main(run_dir: Path) -> None:
     push("- `claude-output/`       — literal stdout+stderr per iteration")
     push("- `crossings.jsonl`      — every detected tick-boundary crossing (derived)")
     push("- `measured_ticks.jsonl` — clean measured ticks with all three capacity estimates (derived)")
+    push("- `bounds.json`          — machine-readable low/mid/high bounds (derived)")
     push("- `probe.sh`             — thin shell wrapper as-run")
     push("- `probe.py`             — the Python probe driver as-run")
     push("- `report.py`            — this script as-run")
@@ -287,10 +386,15 @@ def main(run_dir: Path) -> None:
     push("")
 
     (run_dir / "report.md").write_text("\n".join(lines))
+    if print_bounds:
+        for window in ("5h", "7d"):
+            for line in render_bounds_summary(bounds["windows"][window], pinned_model_family):
+                print(line)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: report.py <run_dir>", file=sys.stderr)
-        sys.exit(2)
-    main(Path(sys.argv[1]))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("run_dir")
+    parser.add_argument("--print-bounds", action="store_true")
+    args = parser.parse_args()
+    main(Path(args.run_dir), args.print_bounds)

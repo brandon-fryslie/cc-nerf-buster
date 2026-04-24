@@ -69,3 +69,7 @@ probe-dry *ARGS:
 # Regenerate report.md from an existing capacity-probe run directory.
 probe-report RUN_DIR:
     python3 tools/capacity-probe/report.py {{RUN_DIR}}
+
+# Recompute and print low/mid/high quota bounds from an existing probe run.
+probe-bounds RUN_DIR:
+    python3 tools/capacity-probe/report.py --print-bounds {{RUN_DIR}}
