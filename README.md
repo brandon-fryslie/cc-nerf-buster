@@ -1,84 +1,84 @@
 # cc-nerf-buster
 
-`cc-nerf-buster` is a local MITM proxy for Anthropic traffic. It records request usage, exposes Prometheus metrics, and estimates 5-hour and 7-day quota capacity.
+Directly measuring the size of Claude Code's quota.
 
-## Build And Verify
+## The Problem
 
-```bash
-just build
-just test
-just vet
-```
+Claude Code tells you what percentage of your quota you've used. It does not tell you what 100% is.
 
-## Capacity-Probe Workflow
+Before the size can be measured it has to be defined. Three questions have to be answered:
 
-Normal usage is one command:
+1. **Which window?** There are at least two rolling budgets — a 5-hour window and a 7-day window — with independent utilization meters that tick forward separately. There is also an overage bucket. The windows are not proportional to each other.
+2. **In what unit?** Input tokens, output tokens, cache-read tokens, and cache-creation tokens are priced differently, and prices differ across model tiers. A quota denominated in a single token type would not behave consistently across runs. The internal budget is a weighted cost: model tier × token-kind multiplier, summed across the mix that ran.
+3. **With what precision?** The utilization meter advances in discrete 1% ticks. A tick is not observable until after it has been crossed. Every measurement of per-tick cost is bracketed by the last observation before the tick and the first observation after it; the gap between those two observations is the measurement uncertainty.
 
-```bash
-just probe
-```
+The quota size is therefore three numbers per window, in an undocumented unit.
 
-Warning: do not use the same Claude account for anything else while the probe is running. If other tracked or untracked usage happens at the same time, the quota utilization numbers will include both and the resulting bounds will be wrong.
+## The Approach
 
-When it exits, it already prints:
+1. **Intercept.** A local MITM proxy sits between Claude Code and `api.anthropic.com`. Every request/response pair is decrypted, parsed, and recorded: input tokens, output tokens, cache reads, cache writes, model.
+2. **Weight.** Each request is converted into a weighted cost using a normalized model/token-kind price scale (Haiku : Sonnet : Opus = 1 : 3 : 5 for input tokens; output = 5× input; cache write = 2× input; cache read = 0.1× input). The ratios are taken from the published [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing); only the ratios matter here, not the absolute prices. The internal quota is assumed to be proportional to this weighted cost. That assumption is not verifiable from outside — the Claude Code quota meter does not expose its own accounting — but the API pricing ratios are the only published reference point, so they are what the probe uses.
+3. **Probe.** A driver runs Claude Code sessions in a loop against a single account, advancing the utilization meter tick by tick. After every request it samples both the accumulated weighted cost and the utilization percentage.
+4. **Bracket.** For each 1% tick observed, the tool records the last pre-tick snapshot and the first post-tick snapshot.
+5. **Scale.** Per-1%-tick cost × 100 = full-quota size, reported as low / midpoint / high from the bracketing step. The result is then projected into a chosen token type.
 
-- the active org/upstream scope
-- 5h low / midpoint / high bounds
-- 7d low / midpoint / high bounds
-- pinned-model full-quota and per-1%-tick token projections
+## The Results
 
-If you only want one window:
+Measured 2026-04-24, probing `api.anthropic.com` with a Claude Max account. Results are projected into two units: **Opus cache-write tokens** and **Opus output tokens**.
 
-```bash
-just probe-5h
-just probe-7d
-```
+### 5-hour window
 
-If you interrupt the probe, it still prints the same summary and then prints the exact resume command. You can also resume explicitly with:
+Opus cache-write tokens (input side):
 
-```bash
-just probe --continue
-```
+| Bound | Full quota  | Per 1% tick |
+| ----- | ----------- | ----------- |
+| Low   | 16,872,898  | 168,729     |
+| Mid   | 16,895,532  | 168,955     |
+| High  | 16,918,166  | 169,182     |
 
-## Bounds Workflow
+Opus output tokens:
 
-Each quota tick is only visible after it has already been crossed, so every measured tick is bracketed by:
+| Bound | Full quota  | Per 1% tick |
+| ----- | ----------- | ----------- |
+| Low   | 6,749,159   | 67,492      |
+| Mid   | 6,758,213   | 67,582      |
+| High  | 6,767,266   | 67,673      |
 
-- `pre`: the last observation before the tick
-- `post`: the first observation after the tick
+### 7-day window
 
-That produces three estimates:
+Opus cache-write tokens (input side):
 
-- `low` / `pre-pre`: lower bound
-- `midpoint`: recommended estimate using the midpoint between the `pre` and `post` costs
-- `high` / `post-post`: upper bound
+| Bound | Full quota  | Per 1% tick |
+| ----- | ----------- | ----------- |
+| Low   | 85,831,758  | 858,318     |
+| Mid   | 85,846,742  | 858,467     |
+| High  | 85,861,725  | 858,617     |
 
-## Probe Run Artifacts
+Opus output tokens:
 
-Each run directory includes:
+| Bound | Full quota  | Per 1% tick |
+| ----- | ----------- | ----------- |
+| Low   | 34,332,703  | 343,327     |
+| Mid   | 34,338,697  | 343,387     |
+| High  | 34,344,690  | 343,447     |
 
-- `manifest.json`: run configuration and baseline snapshot
-- `bounds.json`: machine-readable low / midpoint / high bounds
-- `report.md`: human-readable summary
-- `snapshots.jsonl` and `raw-metrics/`: canonical raw inputs
+The 7-day quota is 5.08× the 5-hour quota.
 
-## Advanced / Rebuild Artifacts
+## Running It Yourself
 
-These are optional maintenance commands, not part of the normal workflow.
+Install, CA trust, operating the proxy, and running your own capacity probe: see [`USAGE.md`](USAGE.md).
 
-Resume the most recent matching run:
+Security model (the tool MITMs your own traffic with a locally-generated root CA): see [`SECURITY.md`](SECURITY.md).
 
-```bash
-just probe --continue
-```
+## Project Files
 
-Rebuild artifacts for an existing run:
+- `proxy.go`, `ssl_inspect.go` — the MITM proxy and its CA.
+- `anthropic.go` — request/response parsing and token extraction.
+- `metrics.go` — Prometheus collector and quota-window bookkeeping.
+- `log.go` — canonical JSONL request log.
+- `tools/capacity-probe/` — Python driver that produces the numbers above.
+- `AGENTS.md` — architectural constraints for contributors.
 
-```bash
-just probe-report /absolute/path/to/run
-just probe-bounds /absolute/path/to/run
-```
+## License
 
-## Interpreting Token Counts
-
-`bounds.json` and `report.md` express capacity in weighted USD and token projections. For Opus, the most useful numbers are usually full quota in input-equivalent tokens and per-1%-tick input-equivalent tokens.
+[MIT](LICENSE).
