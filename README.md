@@ -47,7 +47,6 @@ Before the size can be measured it has to be defined. Three questions have to be
 3. **With what precision?** The utilization meter advances in discrete 1% ticks. A tick is not observable until after it has been crossed. Every measurement of per-tick cost is bracketed by the last observation before the tick and the first observation after it; the gap between those two observations is the measurement uncertainty.
 
 The quota size is therefore three numbers per window, in an undocumented unit.
-co
 ## The Approach
 
 1. **Intercept.** A local MITM proxy sits between Claude Code and `api.anthropic.com`. Every request/response pair is decrypted, parsed, and recorded: input tokens, output tokens, cache reads, cache writes, model.
