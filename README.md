@@ -4,42 +4,18 @@ Directly measuring the size of Claude Code's quota.
 
 ## CC Quota
 
-The numbers below are what we measured for CC's 5h and 7d quota.  We used a Claude Max account on 2026-04-24 to generate this data.
+Measured 2026-04-24 against a Claude Max account.
 
-### Methodology
-
-Each request's tokens are converted into a weighted cost using the published API price ratios. The per-1%-tick cost is bracketed by the last pre-tick observation and the first post-tick observation, and multiplied by 100 to estimate the full-quota size.  Conceptually,
-this is the formula:
-
-```
-weighted_cost(req) = Σ tokens[kind] × model_multiplier × kind_multiplier
-   model_multiplier:  Haiku=1, Sonnet=3, Opus=5
-   kind_multiplier:   input=1, output=5, cache_write=2, cache_read=0.1
-
-full_quota ≈ (weighted_cost between two adjacent 1% ticks) × 100
-```
-
-The figures are **normalized units**, not literal token allowances. The quota is a single weighted budget; expressing it in "cache-write tokens" or any other kind is just one projection of that budget. You can convert to any other unit via the [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
-
-<details>
-<summary>Token-mix breakdown from ~250 of my own sessions</summary>
-
-| Token type                  |       Count |  Share |
-| --------------------------- | ----------: | -----: |
-| cache_read_input_tokens     | 861,364,553 | 94.69% |
-| cache_creation_input_tokens |  37,486,686 |  4.12% |
-| output_tokens               |   5,788,314 |  0.64% |
-| input_tokens                |   4,987,715 |  0.55% |
-</details>
-
-### Quota size — one number per window
+### Quota size
 
 | Window | Opus cache-write tokens | per 1% tick |
 | ------ | ----------------------: | ----------: |
 | 5-hour |              16,895,532 |     168,955 |
 | 7-day  |              85,846,742 |     858,467 |
 
-Cache-writes are the chosen unit because they're roughly the count of fresh tokens you can send to Claude in one prompt without assuming any of it is already cached — i.e. how much new context you can introduce. The 7-day quota is 5.08× the 5-hour quota. Numbers are midpoints; the measured low–high spread is under 0.3%.
+The quota itself is a weighted budget across all four token kinds (input, output, cache-read, cache-write), each priced differently — it isn't denominated in any single kind. Cache-writes are one convenient projection: roughly the count of fresh tokens you can send Claude in one prompt with no caching assumed. Convert to any other kind via the [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
+
+The 7-day quota is 5.08× the 5-hour quota. Numbers are midpoints; measured low–high spread is under 0.3%.
 
 <details>
 <summary>Low / midpoint / high bracket</summary>
@@ -54,7 +30,9 @@ Cache-writes are the chosen unit because they're roughly the count of fresh toke
 | 7-day  | High  |              85,861,725 |
 </details>
 
-### Tokens of each kind, at the measured mix
+### Per-kind quota at one measured mix
+
+The single-number quota tells you how big the budget is. It does *not* tell you how many tokens of each kind you'll burn through to spend it — that depends on your usage mix. Below is the breakdown for one measured mix (~250 of my own sessions):
 
 | Token kind  | Volume mix | Budget share | 5h full quota | 5h /1% tick | 7d full quota | 7d /1% tick |
 | ----------- | ---------: | -----------: | ------------: | ----------: | ------------: | ----------: |
@@ -63,7 +41,19 @@ Cache-writes are the chosen unit because they're roughly the count of fresh toke
 | output      |      0.64% |        14.8% |     1,002,841 |      10,028 |     5,095,469 |      50,954 |
 | input       |      0.55% |         2.6% |       864,135 |       8,641 |     4,390,699 |      43,906 |
 
-Volume mix and budget share diverge because cache_write is 20× the per-token weight of cache_read.
+**Volume mix** is the share of raw tokens of each kind. **Budget share** is what fraction of the weighted quota that mix consumes — different from volume mix because cache-writes cost 20× as much per token as cache-reads. Different mixes give different per-kind numbers; this table only describes the one measured above.
+
+### Methodology
+
+Each request's tokens are converted to a weighted cost. The per-1%-tick cost is bracketed by the last pre-tick observation and the first post-tick observation, then multiplied by 100 to estimate full-quota size.
+
+```
+weighted_cost(req) = Σ tokens[kind] × model_multiplier × kind_multiplier
+   model_multiplier:  Haiku=1, Sonnet=3, Opus=5
+   kind_multiplier:   input=1, output=5, cache_write=2, cache_read=0.1
+
+full_quota ≈ (weighted_cost between two adjacent 1% ticks) × 100
+```
 
 ## The Problem
 
