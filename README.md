@@ -4,7 +4,7 @@ Directly measuring the size of Claude Code's quota.
 
 ## The Results
 
-The numbers below are what this tool measured for a Claude Max account on 2026-04-24. Each request's tokens are converted into a weighted cost using the published API price ratios, the per-1%-tick cost is bracketed by the last pre-tick and first post-tick observation, and that cost is multiplied by 100 to estimate full-quota size:
+The numbers below are what this tool measured for a Claude Max account on 2026-04-24. Each request's tokens are converted into a weighted cost using the published API price ratios. The per-1%-tick cost is bracketed by the last pre-tick observation and the first post-tick observation, and multiplied by 100 to estimate the full-quota size:
 
 ```
 weighted_cost(req) = Σ tokens[kind] × model_multiplier × kind_multiplier
@@ -14,45 +14,25 @@ weighted_cost(req) = Σ tokens[kind] × model_multiplier × kind_multiplier
 full_quota ≈ (weighted_cost between two adjacent 1% ticks) × 100
 ```
 
-The figures are **normalized units**, not literal token allowances. "16.8M Opus cache-write tokens" means the quota is equivalent in weighted cost to writing that many Opus cache tokens — *not* that you get 16.8M cache-write tokens plus 6.7M output tokens. Each table is a different projection of the same underlying weighted-cost budget.
+The figures are **normalized units**, not literal token allowances. "16.8M Opus cache-write tokens" means the quota is equivalent in weighted cost to writing that many Opus cache tokens — *not* that you get 16.8M cache-write tokens plus 6.7M output tokens. Each column is a different projection of the same underlying weighted-cost budget.
 
-Measured 2026-04-24, probing `api.anthropic.com` with a Claude Max account. Results are projected into two units: **Opus cache-write tokens** and **Opus output tokens**.
+Two projections are shown per window because they bracket the realistic ways Claude Code actually spends quota. **Opus cache-write tokens** correspond to the input-side cost — the dominant cost in any session that loads a large context (long files, big tool outputs, system prompts), since cache writes are 2× input price and Claude Code caches aggressively. **Opus output tokens** correspond to the generation-side cost — what you spend when the model produces long responses, edits, or plans, priced 5× input. Most real sessions sit between these two anchors, so reading both columns gives a usable upper and lower bound on how much work a quota tick actually buys.
 
 ### 5-hour window
 
-Opus cache-write tokens (input side):
-
-| Bound | Full quota  | Per 1% tick |
-| ----- | ----------- | ----------- |
-| Low   | 16,872,898  | 168,729     |
-| Mid   | 16,895,532  | 168,955     |
-| High  | 16,918,166  | 169,182     |
-
-Opus output tokens:
-
-| Bound | Full quota  | Per 1% tick |
-| ----- | ----------- | ----------- |
-| Low   | 6,749,159   | 67,492      |
-| Mid   | 6,758,213   | 67,582      |
-| High  | 6,767,266   | 67,673      |
+| Bound | Opus cache-write tokens | Per 1% tick | Opus output tokens | Per 1% tick |
+| ----- | ----------------------- | ----------- | ------------------ | ----------- |
+| Low   | 16,872,898              | 168,729     | 6,749,159          | 67,492      |
+| Mid   | 16,895,532              | 168,955     | 6,758,213          | 67,582      |
+| High  | 16,918,166              | 169,182     | 6,767,266          | 67,673      |
 
 ### 7-day window
 
-Opus cache-write tokens (input side):
-
-| Bound | Full quota  | Per 1% tick |
-| ----- | ----------- | ----------- |
-| Low   | 85,831,758  | 858,318     |
-| Mid   | 85,846,742  | 858,467     |
-| High  | 85,861,725  | 858,617     |
-
-Opus output tokens:
-
-| Bound | Full quota  | Per 1% tick |
-| ----- | ----------- | ----------- |
-| Low   | 34,332,703  | 343,327     |
-| Mid   | 34,338,697  | 343,387     |
-| High  | 34,344,690  | 343,447     |
+| Bound | Opus cache-write tokens | Per 1% tick | Opus output tokens | Per 1% tick |
+| ----- | ----------------------- | ----------- | ------------------ | ----------- |
+| Low   | 85,831,758              | 858,318     | 34,332,703         | 343,327     |
+| Mid   | 85,846,742              | 858,467     | 34,338,697         | 343,387     |
+| High  | 85,861,725              | 858,617     | 34,344,690         | 343,447     |
 
 The 7-day quota is 5.08× the 5-hour quota.
 
