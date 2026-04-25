@@ -25,17 +25,12 @@ Because any Claude Code session will have a different mix of tokens used (some s
 
 Here is a breakdown of ~250 of my own sessions I happened to have data for:
 
-  ┌─────────────────────────────┬─────────────┬────────┐
-  │         Token type          │    Count    │ Share  │
-  ├─────────────────────────────┼─────────────┼────────┤
-  │ cache_read_input_tokens     │ 861,364,553 │ 94.69% │
-  ├─────────────────────────────┼─────────────┼────────┤
-  │ cache_creation_input_tokens │  37,486,686 │  4.12% │
-  ├─────────────────────────────┼─────────────┼────────┤
-  │ output_tokens               │   5,788,314 │  0.64% │
-  ├─────────────────────────────┼─────────────┼────────┤
-  │ input_tokens                │   4,987,715 │  0.55% │
-  └─────────────────────────────┴─────────────┴────────┘
+| Token type                  |       Count |  Share |
+| --------------------------- | ----------: | -----: |
+| cache_read_input_tokens     | 861,364,553 | 94.69% |
+| cache_creation_input_tokens |  37,486,686 |  4.12% |
+| output_tokens               |   5,788,314 |  0.64% |
+| input_tokens                |   4,987,715 |  0.55% |
 
 The two tables below answer two different questions. **"Quota size"** treats the budget as a single number — for comparing accounts, plugging into a calculator, or just having a figure to talk about. **"What you can actually do per tick"** projects that same budget onto a real usage mix, so you can estimate how much Claude Code work fits in a 5-hour or 7-day window.
 
