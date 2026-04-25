@@ -49,14 +49,18 @@ Two projections are shown per window because they bracket the realistic ways Cla
 | Mid   | 16,895,532              | 168,955     | 6,758,213          | 67,582      |
 | High  | 16,918,166              | 169,182     | 6,767,266          | 67,673      |
 
-Projected onto the measured-session mix above, the same midpoint quota covers (in raw Opus tokens, not weighted units):
+Projected onto the measured-session mix above, the same midpoint quota covers (in raw Opus tokens of each type):
 
-| Token kind  | Mix share | Full quota (mid) | Per 1% tick |
-| ----------- | --------: | ---------------: | ----------: |
-| Input       |     0.55% |          864,135 |       8,641 |
-| Output      |     0.64% |        1,002,841 |      10,028 |
-| Cache write |     4.12% |        6,494,671 |      64,946 |
-| Cache read  |    94.69% |      149,233,783 |   1,492,337 |
+| Token kind  | Volume mix | Budget share | Full quota (mid) | Per 1% tick |
+| ----------- | ---------: | -----------: | ---------------: | ----------: |
+| Input       |      0.55% |         2.6% |          864,135 |       8,641 |
+| Output      |      0.64% |        14.8% |        1,002,841 |      10,028 |
+| Cache write |      4.12% |        38.4% |        6,494,671 |      64,946 |
+| Cache read  |     94.69% |        44.2% |      149,233,783 |   1,492,337 |
+
+**Volume mix** is the share of raw tokens of that kind across all the sessions measured above. **Budget share** is the share of the weighted quota that mix consumes — different from volume mix because a cache-read token is 50× cheaper than an output token. Cache-reads dominate volume (94.69%) but only ~44% of the budget; cache-writes are 4.12% of volume but ~38% of the budget because each one is 20× as expensive as a cache-read.
+
+The first table gives you a single number that represents your quota. The second table better represents what you can expect to get in actual usage.
 
 ### 7-day window
 
@@ -68,12 +72,12 @@ Projected onto the measured-session mix above, the same midpoint quota covers (i
 
 Projected onto the measured-session mix above:
 
-| Token kind  | Mix share | Full quota (mid) | Per 1% tick |
-| ----------- | --------: | ---------------: | ----------: |
-| Input       |     0.55% |        4,390,699 |      43,906 |
-| Output      |     0.64% |        5,095,469 |      50,954 |
-| Cache write |     4.12% |       32,999,636 |     329,996 |
-| Cache read  |    94.69% |      758,261,660 |   7,582,616 |
+| Token kind  | Volume mix | Budget share | Full quota (mid) | Per 1% tick |
+| ----------- | ---------: | -----------: | ---------------: | ----------: |
+| Input       |      0.55% |         2.6% |        4,390,699 |      43,906 |
+| Output      |      0.64% |        14.8% |        5,095,469 |      50,954 |
+| Cache write |      4.12% |        38.4% |       32,999,636 |     329,996 |
+| Cache read  |     94.69% |        44.2% |      758,261,660 |   7,582,616 |
 
 The 7-day quota is 5.08× the 5-hour quota.
 
