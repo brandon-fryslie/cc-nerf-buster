@@ -13,7 +13,7 @@ Measured 2026-04-24 against a Claude Max account.
 | 5-hour |              16,895,532 |     168,955 |
 | 7-day  |              85,846,742 |     858,467 |
 
-The quota itself is a weighted budget across all four token kinds (input, output, cache-read, cache-write), each priced differently — it isn't denominated in any single kind. Cache-writes are one convenient projection: roughly the count of fresh tokens you can send Claude in one prompt with no caching assumed. Convert to any other kind via the [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
+The quota itself is a weighted budget across all four token kinds (input, output, cache-read, cache-write), each priced differently — it isn't denominated in any single kind. Cache-writes are one convenient projection: roughly the count of fresh tokens you can send Claude with no caching assumed. Convert to any other kind via the [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
 
 The 7-day quota is 5.08× the 5-hour quota. Numbers are midpoints; measured low–high spread is under 0.3%.
 
