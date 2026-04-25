@@ -1,8 +1,8 @@
 # Usage
 
-How to install `cc-nerf-buster`, run the proxy, and reproduce the quota measurements documented in [`README.md`](README.md).
+How to install `cc-nerf-buster` and reproduce the quota measurements documented in [`README.md`](README.md).
 
-Security model (local CA generation, trust-store implications, revocation) is covered separately in [`SECURITY.md`](SECURITY.md). Read it first.
+The tool runs a TLS-intercepting proxy against your own traffic. It generates a local root CA on first run and trusts it only inside the spawned Claude process — via `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` env vars set by `just probe` and `just login`. Nothing is added to your OS trust store. `just uninstall` removes the binary, the data directory, and the CA key material.
 
 ## Requirements
 
@@ -19,45 +19,13 @@ cd cc-nerf-buster
 just install
 ```
 
-`just install` builds the binary into `~/.local/bin/cc-nerf-buster`, generates a CA under `~/.local/cc-nerf-buster/` (or `$XDG_DATA_HOME/cc-nerf-buster`), and prints the env block to paste into your shell.
-
-Trust the generated CA system-wide (required once). macOS:
-
-```bash
-sudo security add-trusted-cert -d -r trustRoot \
-  -k /Library/Keychains/System.keychain \
-  ~/.local/cc-nerf-buster/ca.crt
-```
-
-For Linux and for revoking trust later, see [`SECURITY.md`](SECURITY.md).
+`just install` builds the binary into `~/.local/bin/cc-nerf-buster` and generates a local CA under `~/.local/cc-nerf-buster/` (or `$XDG_DATA_HOME/cc-nerf-buster`). Nothing is added to your system trust store.
 
 Uninstall with `just uninstall`.
 
-## Run The Proxy
+## Run The Probe
 
-```bash
-cc-nerf-buster
-```
-
-It listens on `:9480` (proxy) and `:9481/metrics` (Prometheus). Point Claude Code at it — the startup banner prints the exact env vars and `~/.claude/settings.json` snippet to use.
-
-A one-shot convenience target that launches Claude Code with all the right env already set:
-
-```bash
-just login
-```
-
-## Build And Verify
-
-```bash
-just build
-just test
-just vet
-```
-
-## Capacity Probe
-
-The probe is what generates the numbers in the README. It drives Claude Code in a loop against a single account, watches the utilization gauge tick, and brackets each tick with pre/post observations.
+The probe is what generates the numbers in the README. It launches Claude Code with the proxy and CA already wired up via environment variables (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, …) scoped to the spawned process, drives it in a loop against a single account, watches the utilization gauge tick, and brackets each tick with pre/post observations.
 
 Normal usage is one command:
 
@@ -117,6 +85,7 @@ Optional maintenance commands, not part of normal use.
 just probe --continue                       # resume most recent matching run
 just probe-report /absolute/path/to/run     # rebuild report.md
 just probe-bounds /absolute/path/to/run     # recompute bounds
+just build && just test && just vet         # build and verify the proxy itself
 ```
 
 ## Interpreting Token Counts

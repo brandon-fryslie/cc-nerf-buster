@@ -58,9 +58,9 @@ co
 
 ## Running It Yourself
 
-Install, CA trust, operating the proxy, and running your own capacity probe: see [`USAGE.md`](USAGE.md).
+Install and run your own capacity probe: see [`USAGE.md`](USAGE.md).
 
-Security model (the tool MITMs your own traffic with a locally-generated root CA): see [`SECURITY.md`](SECURITY.md).
+The tool MITMs your own traffic with a locally-generated root CA. That CA is trusted only by the spawned Claude process (via `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` env vars), not by your OS trust store. `just uninstall` removes the binary, the data directory, and the CA key material.
 
 ## Project Files
 
