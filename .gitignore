@@ -1,5 +1,7 @@
 # Local editor / OS noise
 .DS_Store
+.idea/
+.vscode/
 
 # Local MCP config
 .mcp.json
@@ -14,3 +16,20 @@ __pycache__/
 # Probe run outputs
 tools/capacity-probe/probe-runs/
 
+# TLS material (MITM CA + leaf certs)
+ca.crt
+ca.key
+*.pem
+
+# Secrets
+.env
+.env.*
+
+# Go test / coverage artifacts
+coverage.out
+coverage.html
+*.test
+
+# Python virtualenvs
+.venv/
+venv/
