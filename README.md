@@ -13,7 +13,7 @@ Measured 2026-04-24 against a Claude Max account.
 | 5-hour |              16,895,532 |     168,955 |
 | 7-day  |              85,846,742 |     858,467 |
 
-The quota itself is a weighted budget across all four token kinds (input, output, cache-read, cache-write), each priced differently — it isn't denominated in any single kind. Cache-writes are one convenient projection: roughly the count of tokens you can send Claude without any of them being cached. Convert to any other kind via the [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
+The quota itself is a weighted budget across all four token kinds (input, output, cache-read, cache-write), each priced differently — it isn't denominated in any single kind. Cache-writes are one convenient projection: the volume of fresh prompt tokens you could push through assuming zero cache hits. Convert to any other kind via the [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
 
 The 7-day quota is 5.08× the 5-hour quota. Numbers are midpoints; measured low–high spread is under 0.3%.
 
@@ -32,7 +32,7 @@ The 7-day quota is 5.08× the 5-hour quota. Numbers are midpoints; measured low�
 
 ### Per-kind quota at one measured mix
 
-The single-number quota tells you how big the budget is. It does *not* tell you how many tokens of each kind you'll burn through to spend it — that depends on your usage mix. Below is the breakdown for one measured mix (~250 of my own sessions):
+The single-number quota tells you how big the budget is. It does *not* tell you how many tokens of each kind you'll burn through to spend it — that depends on your usage mix. The breakdown below is for one such mix, drawn from ~250 sessions on the author's account:
 
 | Token kind  | Volume mix | Budget share | 5h full quota | 5h /1% tick | 7d full quota | 7d /1% tick |
 | ----------- | ---------: | -----------: | ------------: | ----------: | ------------: | ----------: |
@@ -65,11 +65,12 @@ Before the size can be measured it has to be defined. Three questions have to be
 2. **In what unit?** Input tokens, output tokens, cache-read tokens, and cache-creation tokens are priced differently, and prices differ across model tiers. A quota denominated in a single token type would not behave consistently across runs. The internal budget is a weighted cost: model tier × token-kind multiplier, summed across the mix that ran.
 3. **With what precision?** The utilization meter advances in discrete 1% ticks. A tick is not observable until after it has been crossed. Every measurement of per-tick cost is bracketed by the last observation before the tick and the first observation after it; the gap between those two observations is the measurement uncertainty.
 
-The quota size is therefore three numbers per window, in an undocumented unit.
+There is no single "magic number" for the quota — it's a weighted budget, not a token count. But once you fix a window and pick a unit to project the budget into, the size becomes one concrete value, with a measurement band set by tick precision. That's what the table at the top reports.
+
 ## The Approach
 
 1. **Intercept.** A local proxy sits between Claude Code and `api.anthropic.com`. Every request/response pair is parsed and recorded: input tokens, output tokens, cache reads, cache writes, model.
-2. **Weight.** Each request is converted into a weighted cost using a normalized model/token-kind price scale (Haiku : Sonnet : Opus = 1 : 3 : 5 for input tokens; output = 5× input; cache write = 2× input; cache read = 0.1× input). The ratios are taken from the published [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing); only the ratios matter here, not the absolute prices. The internal quota is assumed to be proportional to this weighted cost. That assumption is not verifiable from outside — the Claude Code quota meter does not expose its own accounting — but the API pricing ratios are the only published reference point, so they are what the probe uses.
+2. **Weight.** Each request is converted into a weighted cost using the formula in [Methodology](#methodology) above. Ratios come from the published [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing); only the ratios matter, not the absolute prices. The internal quota is assumed proportional to this weighted cost — not verifiable from outside, since the Claude Code meter doesn't expose its accounting, but the pricing ratios are the only published reference point.
 3. **Probe.** A driver runs Claude Code sessions in a loop against a single account, advancing the utilization meter tick by tick. After every request it samples both the accumulated weighted cost and the utilization percentage.
 4. **Bracket.** For each 1% tick observed, the tool records the last pre-tick snapshot and the first post-tick snapshot.
 5. **Scale.** Per-1%-tick cost × 100 = full-quota size, reported as low / midpoint / high from the bracketing step. The result is then projected into a chosen token type.
