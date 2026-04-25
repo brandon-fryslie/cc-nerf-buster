@@ -2,9 +2,14 @@
 
 Directly measuring the size of Claude Code's quota.
 
-## The Results
+## CC Quota
 
-The numbers below are what this tool measured for a Claude Max account on 2026-04-24. Each request's tokens are converted into a weighted cost using the published API price ratios. The per-1%-tick cost is bracketed by the last pre-tick observation and the first post-tick observation, and multiplied by 100 to estimate the full-quota size:
+The numbers below are what we measured for CC's 5h and 7d quota.  We used a Claude Max account on 2026-04-24 to generate this data.
+
+### Methodology
+
+Each request's tokens are converted into a weighted cost using the published API price ratios. The per-1%-tick cost is bracketed by the last pre-tick observation and the first post-tick observation, and multiplied by 100 to estimate the full-quota size.  Conceptually,
+this is the formula:
 
 ```
 weighted_cost(req) = Σ tokens[kind] × model_multiplier × kind_multiplier
@@ -16,6 +21,24 @@ full_quota ≈ (weighted_cost between two adjacent 1% ticks) × 100
 
 The figures are **normalized units**, not literal token allowances. "16.8M Opus cache-write tokens" means the quota is equivalent in weighted cost to writing that many Opus cache tokens — *not* that you get 16.8M cache-write tokens plus 6.7M output tokens. Each column is a different projection of the same underlying weighted-cost budget.
 
+Because any Claude Code session will have a different mix of tokens used (some sessions might have more output, or more cache misses, etc), there is no single number that directly represents your remaining quota.  No doubt this is why Anthropic does not report one - it doesn't exist.  I have normalized the units into 2 units, each representing your entire quota: cache-write (or cache-create) tokens, and output tokens.  I chose these because they're reasonably intuitive.  When you start a new session, your tokens are billed as cache-write.  When you receive tokens, those are billed as output tokens.
+
+Here is a breakdown of ~250 of my own sessions I happened to have data for:
+
+  ┌─────────────────────────────┬─────────────┬────────┐
+  │         Token type          │    Count    │ Share  │
+  ├─────────────────────────────┼─────────────┼────────┤
+  │ cache_read_input_tokens     │ 861,364,553 │ 94.69% │
+  ├─────────────────────────────┼─────────────┼────────┤
+  │ cache_creation_input_tokens │  37,486,686 │  4.12% │
+  ├─────────────────────────────┼─────────────┼────────┤
+  │ output_tokens               │   5,788,314 │  0.64% │
+  ├─────────────────────────────┼─────────────┼────────┤
+  │ input_tokens                │   4,987,715 │  0.55% │
+  └─────────────────────────────┴─────────────┴────────┘
+
+You can directly convert the normalized units I chose into any other units by using Anthropic's pricing table: https://platform.claude.com/docs/en/about-claude/pricing
+
 Two projections are shown per window because they bracket the realistic ways Claude Code actually spends quota. **Opus cache-write tokens** correspond to the input-side cost — the dominant cost in any session that loads a large context (long files, big tool outputs, system prompts), since cache writes are 2× input price and Claude Code caches aggressively. **Opus output tokens** correspond to the generation-side cost — what you spend when the model produces long responses, edits, or plans, priced 5× input. Most real sessions sit between these two anchors, so reading both columns gives a usable upper and lower bound on how much work a quota tick actually buys.
 
 ### 5-hour window
@@ -26,6 +49,15 @@ Two projections are shown per window because they bracket the realistic ways Cla
 | Mid   | 16,895,532              | 168,955     | 6,758,213          | 67,582      |
 | High  | 16,918,166              | 169,182     | 6,767,266          | 67,673      |
 
+Projected onto the measured-session mix above, the same midpoint quota covers (in raw Opus tokens, not weighted units):
+
+| Token kind  | Mix share | Full quota (mid) | Per 1% tick |
+| ----------- | --------: | ---------------: | ----------: |
+| Input       |     0.55% |          864,135 |       8,641 |
+| Output      |     0.64% |        1,002,841 |      10,028 |
+| Cache write |     4.12% |        6,494,671 |      64,946 |
+| Cache read  |    94.69% |      149,233,783 |   1,492,337 |
+
 ### 7-day window
 
 | Bound | Opus cache-write tokens | Per 1% tick | Opus output tokens | Per 1% tick |
@@ -33,6 +65,15 @@ Two projections are shown per window because they bracket the realistic ways Cla
 | Low   | 85,831,758              | 858,318     | 34,332,703         | 343,327     |
 | Mid   | 85,846,742              | 858,467     | 34,338,697         | 343,387     |
 | High  | 85,861,725              | 858,617     | 34,344,690         | 343,447     |
+
+Projected onto the measured-session mix above:
+
+| Token kind  | Mix share | Full quota (mid) | Per 1% tick |
+| ----------- | --------: | ---------------: | ----------: |
+| Input       |     0.55% |        4,390,699 |      43,906 |
+| Output      |     0.64% |        5,095,469 |      50,954 |
+| Cache write |     4.12% |       32,999,636 |     329,996 |
+| Cache read  |    94.69% |      758,261,660 |   7,582,616 |
 
 The 7-day quota is 5.08× the 5-hour quota.
 
