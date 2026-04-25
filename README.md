@@ -49,7 +49,7 @@ Before the size can be measured it has to be defined. Three questions have to be
 The quota size is therefore three numbers per window, in an undocumented unit.
 ## The Approach
 
-1. **Intercept.** A local MITM proxy sits between Claude Code and `api.anthropic.com`. Every request/response pair is decrypted, parsed, and recorded: input tokens, output tokens, cache reads, cache writes, model.
+1. **Intercept.** A local proxy sits between Claude Code and `api.anthropic.com`. Every request/response pair is parsed and recorded: input tokens, output tokens, cache reads, cache writes, model.
 2. **Weight.** Each request is converted into a weighted cost using a normalized model/token-kind price scale (Haiku : Sonnet : Opus = 1 : 3 : 5 for input tokens; output = 5× input; cache write = 2× input; cache read = 0.1× input). The ratios are taken from the published [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing); only the ratios matter here, not the absolute prices. The internal quota is assumed to be proportional to this weighted cost. That assumption is not verifiable from outside — the Claude Code quota meter does not expose its own accounting — but the API pricing ratios are the only published reference point, so they are what the probe uses.
 3. **Probe.** A driver runs Claude Code sessions in a loop against a single account, advancing the utilization meter tick by tick. After every request it samples both the accumulated weighted cost and the utilization percentage.
 4. **Bracket.** For each 1% tick observed, the tool records the last pre-tick snapshot and the first post-tick snapshot.
@@ -59,11 +59,9 @@ The quota size is therefore three numbers per window, in an undocumented unit.
 
 Install and run your own capacity probe: see [`USAGE.md`](USAGE.md).
 
-The tool MITMs your own traffic with a locally-generated root CA. That CA is trusted only by the spawned Claude process (via `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` env vars), not by your OS trust store. `just uninstall` removes the binary, the data directory, and the CA key material.
-
 ## Project Files
 
-- `proxy.go`, `ssl_inspect.go` — the MITM proxy and its CA.
+- `proxy.go` — the local proxy.
 - `anthropic.go` — request/response parsing and token extraction.
 - `metrics.go` — Prometheus collector and quota-window bookkeeping.
 - `log.go` — canonical JSONL request log.

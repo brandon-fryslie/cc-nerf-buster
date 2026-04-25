@@ -23,30 +23,6 @@ clean:
 install *ARGS:
     ./scripts/install.sh {{ARGS}}
 
-login:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/cc-nerf-buster}"
-    CA_CERT="$DATA_DIR/ca.crt"
-    CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$DATA_DIR/claude-config}"
-    PORT=9480
-    if [[ ! -f "$CA_CERT" ]]; then
-        echo "Missing CA cert at $CA_CERT. Run 'just install' first." >&2
-        exit 1
-    fi
-    mkdir -p "$CLAUDE_CONFIG_DIR"
-    export CLAUDE_CONFIG_DIR
-    export https_proxy="http://localhost:$PORT"
-    export HTTPS_PROXY="http://localhost:$PORT"
-    export http_proxy="http://localhost:$PORT"
-    export HTTP_PROXY="http://localhost:$PORT"
-    export NODE_EXTRA_CA_CERTS="$CA_CERT"
-    export SSL_CERT_FILE="$CA_CERT"
-    export CURL_CA_BUNDLE="$CA_CERT"
-    export REQUESTS_CA_BUNDLE="$CA_CERT"
-    export GIT_SSL_CAINFO="$CA_CERT"
-    exec claude
-
 uninstall:
     ./scripts/uninstall.sh
 

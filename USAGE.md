@@ -2,8 +2,6 @@
 
 How to install `cc-nerf-buster` and reproduce the quota measurements documented in [`README.md`](README.md).
 
-The tool runs a TLS-intercepting proxy against your own traffic. It generates a local root CA on first run and trusts it only inside the spawned Claude process — via `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` env vars set by `just probe` and `just login`. Nothing is added to your OS trust store. `just uninstall` removes the binary, the data directory, and the CA key material.
-
 ## Requirements
 
 - Go 1.25+
@@ -19,13 +17,13 @@ cd cc-nerf-buster
 just install
 ```
 
-`just install` builds the binary into `~/.local/bin/cc-nerf-buster` and generates a local CA under `~/.local/cc-nerf-buster/` (or `$XDG_DATA_HOME/cc-nerf-buster`). Nothing is added to your system trust store.
+`just install` builds the binary into `~/.local/bin/cc-nerf-buster` and configures a local data dir under `~/.local/cc-nerf-buster/` (or `$XDG_DATA_HOME/cc-nerf-buster`).
 
 Uninstall with `just uninstall`.
 
 ## Run The Probe
 
-The probe is what generates the numbers in the README. It launches Claude Code with the proxy and CA already wired up via environment variables (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, …) scoped to the spawned process, drives it in a loop against a single account, watches the utilization gauge tick, and brackets each tick with pre/post observations.
+The probe is what generates the numbers in the README. It launches Claude Code with the proxy already wired up via environment variables scoped to the spawned process, drives it in a loop against a single account, watches the utilization gauge tick, and brackets each tick with pre/post observations.
 
 Normal usage is one command:
 

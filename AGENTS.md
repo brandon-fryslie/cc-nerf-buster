@@ -4,7 +4,7 @@ This file defines how agents should work in this repository. It is derived from 
 
 ## Purpose
 
-`cc-nerf-buster` is a Go proxy that MITMs configured Anthropic API traffic, extracts usage and quota signals, logs canonical request events, and estimates 5-hour and 7-day quota capacity.
+`cc-nerf-buster` is a Go proxy that sits between Claude Code and configured Anthropic API hosts, extracts usage and quota signals from request/response traffic, logs canonical request events, and estimates 5-hour and 7-day quota capacity.
 
 Primary success criteria:
 
@@ -57,7 +57,7 @@ Additional standing guidance:
 The core path is:
 
 1. `main.go` parses flags, initializes runtime state, and starts the proxy and metrics servers.
-2. `proxy.go` handles CONNECT tunneling/MITM interception and forwards traffic upstream.
+2. `proxy.go` forwards traffic upstream.
 3. `anthropic.go` extracts request, response, SSE usage, pricing, and quota metadata.
 4. `log.go` writes canonical JSONL events.
 5. `metrics.go` records counters/gauges and persists quota estimation state.
@@ -75,7 +75,6 @@ Keep this order legible. If you change behavior, do it by changing the data pass
 
 - Host filtering is enforced by configured `--upstream-url` values. Do not duplicate capture gating in scattered call sites. `// [LAW:single-enforcer] upstream interception should be decided at the proxy boundary`
 - Metrics persistence is owned by `metrics.go`.
-- CA creation/loading is owned by `ssl_inspect.go`.
 - Throttled operational logging should go through `throttledLog(...)`.
 
 ### Cross-File Consistency
@@ -119,7 +118,7 @@ Single-test examples:
 
 ### Repo-Specific Constraints
 
-- Only configured upstream hosts are inspected; other traffic remains pass-through.
+- Only configured upstream hosts are observed; other traffic remains pass-through.
 - SSE and non-streaming responses intentionally take different extraction paths. Do not collapse them unless behavior remains equivalent.
 - Non-streaming usage extraction currently buffers up to 10 MB. If you change this limit or behavior, update the documentation and tests with the same change.
 - Unknown models are not a soft success path; they increment dedicated error counters and should remain visible in probe/report workflows.
@@ -147,11 +146,10 @@ Do not hand testing back to the user unless there is no deterministic way to ver
 ## File Map
 
 - `main.go`: entrypoint, flag parsing, lifecycle, server wiring
-- `proxy.go`: HTTP proxy behavior, CONNECT handling, MITM path
+- `proxy.go`: HTTP proxy behavior, CONNECT handling, local TLS termination path
 - `anthropic.go`: request/response parsing, SSE usage parsing, pricing/cost logic
 - `metrics.go`: counters, gauges, quota estimators, persistence
 - `log.go`: JSONL event sink
-- `ssl_inspect.go`: CA generation/loading and TLS inspection support
 - `throttle.go`: throttled operational logging
 - `tools/capacity-probe/`: external calibration and reporting workflow
 

@@ -21,10 +21,10 @@
 
 - `main.go` wires the app together:
   - Parses flags (`--port`, `--metrics`, `--data-dir`, repeatable `--upstream-url`, optional `--proxy`).
-  - Initializes persistent data dir, CA (`ssl_inspect.go`), metrics (`metrics.go`), JSONL logging (`log.go`), and the proxy handler (`proxy.go`).
+  - Initializes persistent data dir, metrics (`metrics.go`), JSONL logging (`log.go`), and the proxy handler (`proxy.go`).
   - Runs two HTTP servers: proxy traffic and Prometheus metrics.
 - `proxy.go` is the core traffic path:
-  - CONNECT requests to configured upstream hosts are MITM-inspected via dynamic certs from `CertAuthority`.
+  - CONNECT requests to configured upstream hosts are terminated locally with dynamic certs from `CertAuthority` and re-issued upstream.
   - Other CONNECT traffic is tunneled blindly (or chained through downstream proxy if configured).
   - Captured HTTPS requests are replayed upstream, response bodies are streamed to the client, and usage/quota data is extracted for logging/metrics.
 - `anthropic.go` defines extraction and cost logic:
@@ -41,7 +41,7 @@
 
 ## Key conventions in this codebase
 
-- Capture scope is host-gated: only hosts in `--upstream-url` (default `api.anthropic.com`) are inspected; everything else is pass-through proxy behavior.
+- Capture scope is host-gated: only hosts in `--upstream-url` (default `api.anthropic.com`) are observed; everything else is pass-through proxy behavior.
 - `APIEvent` is the canonical log record. Optional fields use pointers; errors are short machine-readable codes (for example `quota_headers_missing`, `model_field_missing`) rather than freeform text.
 - Streaming and non-streaming responses are handled differently on purpose:
   - SSE responses are forwarded incrementally while parsing usage from event lines.
@@ -51,4 +51,4 @@
   - Unknown models intentionally increment `ccnb_no_model_error_*` counters and are treated as a probe-failure condition.
 - Metrics keying uses packed internal keys (`\x00` separators) for map indexes, while persisted estimate keys use `org/upstream` strings.
 - Throttled operational logging should go through `throttledLog(category, ...)` to avoid noisy repeated logs (60-second suppression window per category).
-- Persistent runtime artifacts live under `data-dir` (`usage.jsonl`, `quota_estimates.json`, `ca.crt`, `ca.key`) and are part of normal operation, not temporary files.
+- Persistent runtime artifacts live under `data-dir` (`usage.jsonl`, `quota_estimates.json`) and are part of normal operation, not temporary files.
