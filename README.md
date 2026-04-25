@@ -21,7 +21,8 @@ full_quota ≈ (weighted_cost between two adjacent 1% ticks) × 100
 
 The figures are **normalized units**, not literal token allowances. The quota is a single weighted budget; expressing it in "cache-write tokens" or any other kind is just one projection of that budget. You can convert to any other unit via the [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
 
-Token-mix breakdown from ~250 of my own sessions:
+<details>
+<summary>Token-mix breakdown from ~250 of my own sessions</summary>
 
 | Token type                  |       Count |  Share |
 | --------------------------- | ----------: | -----: |
@@ -29,6 +30,7 @@ Token-mix breakdown from ~250 of my own sessions:
 | cache_creation_input_tokens |  37,486,686 |  4.12% |
 | output_tokens               |   5,788,314 |  0.64% |
 | input_tokens                |   4,987,715 |  0.55% |
+</details>
 
 ### Quota size — one number per window
 
