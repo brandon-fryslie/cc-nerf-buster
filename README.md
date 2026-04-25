@@ -32,7 +32,7 @@ Here is a breakdown of ~250 of my own sessions I happened to have data for:
 | output_tokens               |   5,788,314 |  0.64% |
 | input_tokens                |   4,987,715 |  0.55% |
 
-The two tables below answer two different questions. **"Quota size"** treats the budget as a single number — for comparing accounts, plugging into a calculator, or just having a figure to talk about. **"What you can actually do per tick"** projects that same budget onto a real usage mix, so you can estimate how much Claude Code work fits in a 5-hour or 7-day window.
+Two tables. The first is the quota as a single normalized number, in two equivalent units. The second projects that same budget onto the measured mix and breaks it down by token kind.
 
 ### Quota size — one number per window
 
@@ -60,29 +60,18 @@ Each 1% tick is bracketed by the last observation before the tick (low) and the 
 | 7-day  | High  |         34,344,690 |              85,861,725 |
 </details>
 
-### What you can actually do per tick
+### Tokens of each kind, at the measured mix
 
-The numbers above are *normalized* — they assume the entire quota goes to one token kind. Real Claude Code sessions spend across all four kinds, and the cheap ones (cache reads) consume most of the volume. Projected onto the measured 250-session mix above, the same quota covers:
-
-| Window | Output tokens (model writes back) | per 1% tick | Cache-write tokens (new context loaded) | per 1% tick |
-| ------ | --------------------------------: | ----------: | ---------------------------------------: | ----------: |
-| 5-hour |                         1,002,841 |      10,028 |                                6,494,671 |      64,946 |
-| 7-day  |                         5,095,469 |      50,954 |                               32,999,636 |     329,996 |
-
-These are the two numbers that map onto practical work. **Output tokens** are what the model generates and you read. **Cache-write tokens** are how much new content (files, tool output, long prompts) you can introduce into a session before the cache absorbs it. Input tokens (~0.55% of mix) and cache reads (~94.7% of mix but cheap to re-read) are ambient bookkeeping and aren't shown here.
-
-<details>
-<summary>Full per-kind breakdown (all four token kinds, with budget share)</summary>
+The single-number quota above is normalized — it assumes 100% spend on one kind. Projected onto the measured 250-session mix, the same budget breaks down as:
 
 | Token kind  | Volume mix | Budget share | 5h full quota | 5h /1% tick | 7d full quota | 7d /1% tick |
 | ----------- | ---------: | -----------: | ------------: | ----------: | ------------: | ----------: |
-| Input       |      0.55% |         2.6% |       864,135 |       8,641 |     4,390,699 |      43,906 |
-| Output      |      0.64% |        14.8% |     1,002,841 |      10,028 |     5,095,469 |      50,954 |
-| Cache write |      4.12% |        38.4% |     6,494,671 |      64,946 |    32,999,636 |     329,996 |
-| Cache read  |     94.69% |        44.2% |   149,233,783 |   1,492,337 |   758,261,660 |   7,582,616 |
+| cache_read  |     94.69% |        44.2% |   149,233,783 |   1,492,337 |   758,261,660 |   7,582,616 |
+| cache_write |      4.12% |        38.4% |     6,494,671 |      64,946 |    32,999,636 |     329,996 |
+| output      |      0.64% |        14.8% |     1,002,841 |      10,028 |     5,095,469 |      50,954 |
+| input       |      0.55% |         2.6% |       864,135 |       8,641 |     4,390,699 |      43,906 |
 
-**Volume mix** = share of raw tokens. **Budget share** = share of the weighted quota that mix consumes. The two differ because token kinds are priced differently: a cache-write token is 20× more expensive than a cache-read token, which is why cache writes are only 4.12% of volume but 38.4% of the budget.
-</details>
+Volume mix and budget share diverge because cache_write is 20× the per-token weight of cache_read — so 4.12% of raw tokens consumes 38.4% of the budget.
 
 ## The Problem
 
