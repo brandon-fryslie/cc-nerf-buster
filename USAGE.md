@@ -31,7 +31,8 @@ Normal usage is one command:
 just probe
 ```
 
-> Do not use the same Claude account for anything else while the probe is running. If other tracked or untracked usage happens concurrently, the quota numbers will include both and the resulting bounds will be wrong.
+> [!WARNING]
+> **Do not use the same Claude account for anything else while the probe is running.** If other tracked or untracked usage happens concurrently, the quota numbers will include both and the resulting bounds will be wrong.
 
 When it exits, it prints:
 
