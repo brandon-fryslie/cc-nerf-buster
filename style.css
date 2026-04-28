@@ -1,0 +1,301 @@
+/* gh-pages-showcase template — drop-in styles.
+ * Override any of the CSS variables below to retheme. */
+:root {
+  --bg: #0d1117;
+  --bg-elev: #161b22;
+  --bg-elev2: #1c222b;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --text-faint: #6e7681;
+  --accent: #d8b89a;
+  --accent-warm: #c89a78;
+  --accent-cool: #79b8ff;
+  --link: #79b8ff;
+  --rule: #30363d;
+  --max: 960px;
+  --max-wide: 1140px;
+  --code-bg: #0a0d12;
+  --hero-tint: rgba(216, 184, 154, 0.08);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code {
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.92em;
+  background: var(--bg-elev);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--rule);
+}
+
+.container {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* HERO */
+.hero {
+  background:
+    radial-gradient(1100px 360px at 14% 0%, var(--hero-tint), transparent 60%),
+    linear-gradient(180deg, #141a26 0%, var(--bg) 100%);
+  padding: 80px 0 60px;
+  border-bottom: 1px solid var(--rule);
+}
+.eyebrow {
+  margin: 0 0 8px;
+  color: var(--accent);
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  letter-spacing: 0.06em;
+  text-transform: lowercase;
+}
+.hero h1 {
+  margin: 0 0 14px;
+  font-size: clamp(2.2rem, 6vw, 3.6rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+.tagline {
+  margin: 0 0 20px;
+  color: var(--text-dim);
+  font-size: clamp(1.05rem, 1.8vw, 1.3rem);
+  max-width: 60ch;
+  line-height: 1.5;
+}
+.badges {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 24px;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.78rem;
+  padding: 4px 11px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: rgba(13, 17, 23, 0.45);
+}
+.badge .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.ctas {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cta {
+  padding: 10px 18px;
+  border-radius: 7px;
+  font-family: inherit;
+  font-size: 0.94rem;
+  font-weight: 500;
+  border: 1px solid var(--rule);
+  background: var(--bg-elev);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 120ms, background 120ms, transform 100ms;
+  text-decoration: none;
+}
+.cta:hover {
+  border-color: var(--accent-warm);
+  background: var(--bg-elev2);
+  text-decoration: none;
+  transform: translateY(-1px);
+}
+.cta.primary {
+  background: var(--accent);
+  color: #1a1410;
+  border-color: var(--accent);
+}
+.cta.primary:hover {
+  background: var(--accent-warm);
+  border-color: var(--accent-warm);
+  color: #fff;
+}
+
+/* VISUAL */
+.visual {
+  padding: 40px 0;
+}
+.visual-frame {
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--bg-elev);
+  box-shadow: 0 12px 60px -20px rgba(0, 0, 0, 0.6);
+}
+.visual-frame img,
+.visual-frame video,
+.visual-frame iframe {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 0;
+}
+.visual-frame iframe { aspect-ratio: 16 / 9; }
+.visual-frame pre {
+  margin: 0;
+  padding: 24px;
+  background: var(--code-bg);
+  color: var(--text);
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.88rem;
+  line-height: 1.6;
+  overflow-x: auto;
+}
+
+/* CONTENT SECTIONS */
+.content {
+  padding: 56px 0 32px;
+  border-top: 1px solid var(--rule);
+}
+.content:first-of-type { border-top: none; }
+.content h2 {
+  margin: 0 0 28px;
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+}
+
+/* HIGHLIGHTS */
+.highlights-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+.highlight-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 18px 20px;
+  transition: border-color 120ms, background 120ms;
+}
+.highlight-card:hover {
+  border-color: var(--accent-warm);
+  background: var(--bg-elev2);
+}
+.highlight-card h3 {
+  margin: 0 0 8px;
+  font-size: 1.02rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.highlight-card p {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+/* QUICKSTART CODE BLOCK */
+.code-block {
+  margin: 0;
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 20px 24px;
+  overflow-x: auto;
+  position: relative;
+}
+.code-block code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.88rem;
+  line-height: 1.65;
+  color: var(--text);
+  white-space: pre;
+}
+
+/* SCREENSHOTS */
+.screenshots {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+.screenshot-figure {
+  margin: 0;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg-elev);
+}
+.screenshot-figure img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.screenshot-figure figcaption {
+  padding: 10px 14px;
+  color: var(--text-dim);
+  font-size: 0.84rem;
+  border-top: 1px solid var(--rule);
+}
+
+/* LINKS LIST */
+.links-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+.links-list li a {
+  display: block;
+  padding: 12px 16px;
+  background: var(--bg-elev);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.88rem;
+  color: var(--accent-cool);
+  transition: border-color 120ms, background 120ms;
+}
+.links-list li a:hover {
+  border-color: var(--accent-warm);
+  background: var(--bg-elev2);
+  text-decoration: none;
+}
+
+/* FOOTER */
+footer {
+  padding: 32px 0 40px;
+  border-top: 1px solid var(--rule);
+  color: var(--text-faint);
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.78rem;
+}
+footer a { color: var(--text-dim); }
+
+@media (max-width: 600px) {
+  .hero { padding: 56px 0 40px; }
+  .ctas { flex-direction: column; }
+  .cta { width: 100%; text-align: center; }
+}

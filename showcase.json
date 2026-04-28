@@ -1,0 +1,64 @@
+{
+  "project": {
+    "eyebrow": "an experiment by brandon-fryslie",
+    "name": "cc-nerf-buster",
+    "tagline": "Directly measuring the size of Claude Code's quota — what 100% actually is, in tokens, with bracketed precision.",
+    "github_url": "https://github.com/brandon-fryslie/cc-nerf-buster",
+    "language": "Go",
+    "license": "MIT",
+    "badges": ["Go 1.25+", "Local proxy + capacity probe"],
+    "ctas": [
+      { "label": "View source",  "url": "https://github.com/brandon-fryslie/cc-nerf-buster", "primary": true },
+      { "label": "Methodology",  "url": "https://github.com/brandon-fryslie/cc-nerf-buster#methodology" },
+      { "label": "Run the probe","url": "https://github.com/brandon-fryslie/cc-nerf-buster/blob/master/USAGE.md" }
+    ]
+  },
+
+  "hero": {
+    "kind": "code",
+    "code": "# Measured 2026-04-24 against a Claude Max account\n# Quota expressed in Opus cache-write tokens\n\n  Window     Full quota (mid)    per 1% tick\n  ─────────────────────────────────────────\n  5-hour     16,895,532          168,955\n  7-day      85,846,742          858,467\n\n# Spread between low/high bounds: under 0.3%\n# 7-day quota ≈ 5.08× the 5-hour quota\n#\n# The internal quota is a weighted budget across input,\n# output, cache-read, and cache-write tokens — each\n# priced differently. Cache-writes above are one\n# convenient projection of that weighted budget."
+  },
+
+  "highlights": [
+    {
+      "title": "What 100% actually is",
+      "description": "Claude Code shows you a percentage but never tells you what the denominator is. cc-nerf-buster pins the denominator to a concrete number, in the token kind of your choice, with measurement bands."
+    },
+    {
+      "title": "Two windows, separately probed",
+      "description": "The 5-hour and 7-day rolling budgets aren't proportional — each gets its own utilization gauge and its own measurement run. Both numbers are reported independently."
+    },
+    {
+      "title": "Weighted-cost methodology",
+      "description": "Each request is converted into a weighted cost using published API pricing ratios: model tier × token-kind multiplier, summed across the mix. Only the ratios matter, not absolute prices."
+    },
+    {
+      "title": "Bracketed precision",
+      "description": "The utilization meter only ticks in whole percent. Each tick is bracketed by the last observation before the crossing and the first after, yielding low / midpoint / high bounds — measured spread is under 0.3%."
+    },
+    {
+      "title": "Local proxy intercepts the truth",
+      "description": "A local Go proxy sits between Claude Code and api.anthropic.com, parsing every request/response pair: input, output, cache-read, cache-write tokens, plus model used. No log scraping, no estimation."
+    },
+    {
+      "title": "Reproducible on your own account",
+      "description": "One command — just probe — drives Claude Code in a loop, watches the gauge tick, and prints the bounds. Your quota size, your numbers, your account."
+    }
+  ],
+
+  "quickstart": {
+    "code": "# Install\ngit clone https://github.com/brandon-fryslie/cc-nerf-buster\ncd cc-nerf-buster\njust install\n\n# Run a full probe (both 5h and 7d windows)\njust probe\n\n# Or one window at a time\njust probe-5h\njust probe-7d\n\n# Resume an interrupted run\njust probe --continue\n\n# Output: 5h and 7d low/mid/high bounds, plus per-1%-tick\n# token projections for the model you pinned."
+  },
+
+  "links": [
+    { "label": "Anthropic API pricing table", "url": "https://platform.claude.com/docs/en/about-claude/pricing" },
+    { "label": "USAGE.md — installing and running the probe", "url": "https://github.com/brandon-fryslie/cc-nerf-buster/blob/master/USAGE.md" },
+    { "label": "AGENTS.md — architectural constraints", "url": "https://github.com/brandon-fryslie/cc-nerf-buster/blob/master/AGENTS.md" },
+    { "label": "deployed-sites index", "url": "https://brandon-fryslie.github.io/" }
+  ],
+
+  "headings": {
+    "highlights": "What it does",
+    "quickstart": "Run it yourself"
+  }
+}
