@@ -1,0 +1,93 @@
+{
+  "run_dir": "/Users/bmf/.local/cc-nerf-buster/probe-runs/20260427T211350Z",
+  "model": "claude-opus-4-7",
+  "org": "51dc129f-1e02-4826-af48-24c47982a037",
+  "upstream": "api.anthropic.com",
+  "windows": {
+    "5h": {
+      "window": "5h",
+      "clean_measured_ticks": 3,
+      "proxy_lifetime_capacity_usd": 194.64284821428564,
+      "weighted_usd": {
+        "low_pre": 297.0765833333335,
+        "midpoint": 292.40941666666686,
+        "high_post": 287.7422500000002,
+        "selected": 292.40941666666686
+      },
+      "tokens": {
+        "low_pre": {
+          "haiku": {
+            "input_full_quota": 297076583,
+            "input_per_tick": 2970766,
+            "output_full_quota": 59415317,
+            "output_per_tick": 594153
+          },
+          "sonnet": {
+            "input_full_quota": 99025528,
+            "input_per_tick": 990255,
+            "output_full_quota": 19805106,
+            "output_per_tick": 198051
+          },
+          "opus": {
+            "input_full_quota": 59415317,
+            "input_per_tick": 594153,
+            "output_full_quota": 11883063,
+            "output_per_tick": 118831
+          }
+        },
+        "midpoint": {
+          "haiku": {
+            "input_full_quota": 292409417,
+            "input_per_tick": 2924094,
+            "output_full_quota": 58481883,
+            "output_per_tick": 584819
+          },
+          "sonnet": {
+            "input_full_quota": 97469806,
+            "input_per_tick": 974698,
+            "output_full_quota": 19493961,
+            "output_per_tick": 194940
+          },
+          "opus": {
+            "input_full_quota": 58481883,
+            "input_per_tick": 584819,
+            "output_full_quota": 11696377,
+            "output_per_tick": 116964
+          }
+        },
+        "high_post": {
+          "haiku": {
+            "input_full_quota": 287742250,
+            "input_per_tick": 2877423,
+            "output_full_quota": 57548450,
+            "output_per_tick": 575485
+          },
+          "sonnet": {
+            "input_full_quota": 95914083,
+            "input_per_tick": 959141,
+            "output_full_quota": 19182817,
+            "output_per_tick": 191828
+          },
+          "opus": {
+            "input_full_quota": 57548450,
+            "input_per_tick": 575485,
+            "output_full_quota": 11509690,
+            "output_per_tick": 115097
+          }
+        }
+      }
+    },
+    "7d": {
+      "window": "7d",
+      "clean_measured_ticks": 0,
+      "proxy_lifetime_capacity_usd": 479.7539374999993,
+      "weighted_usd": {
+        "low_pre": null,
+        "midpoint": null,
+        "high_post": null,
+        "selected": 479.7539374999993
+      },
+      "tokens": null
+    }
+  }
+}

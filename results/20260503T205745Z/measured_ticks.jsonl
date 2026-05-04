@@ -1,0 +1,9 @@
+{"window": "5h", "tick_from": 0.02, "tick_to": 0.03, "start_label": "002-after", "end_label": "004-after", "cap_pre_usd": 183.92350000000002, "cap_post_usd": 177.46050000000002, "cap_midpoint_usd": 180.69200000000004}
+{"window": "5h", "tick_from": 0.03, "tick_to": 0.04, "start_label": "004-after", "end_label": "014-after", "cap_pre_usd": 249.5384999999998, "cap_post_usd": 248.58249999999975, "cap_midpoint_usd": 249.06049999999982}
+{"window": "5h", "tick_from": 0.04, "tick_to": 0.05, "start_label": "014-after", "end_label": "029-after", "cap_pre_usd": 290.8297500000005, "cap_post_usd": 290.8297500000006, "cap_midpoint_usd": 290.8297500000005}
+{"window": "5h", "tick_from": 0.05, "tick_to": 0.06, "start_label": "029-after", "end_label": "033-after", "cap_pre_usd": 360.4280000000001, "cap_post_usd": 519.344, "cap_midpoint_usd": 439.8860000000001}
+{"window": "5h", "tick_from": 0.06, "tick_to": 0.07, "start_label": "033-after", "end_label": "037-after", "cap_pre_usd": 216.35000000000008, "cap_post_usd": 64.8530000000001, "cap_midpoint_usd": 140.6015}
+{"window": "5h", "tick_from": 0.07, "tick_to": 0.08, "start_label": "037-after", "end_label": "060-after", "cap_pre_usd": 301.7177500000006, "cap_post_usd": 295.1607500000007, "cap_midpoint_usd": 298.4392500000005}
+{"window": "5h", "tick_from": 0.08, "tick_to": 0.09, "start_label": "060-after", "end_label": "092-after", "cap_pre_usd": 288.38750000000175, "cap_post_usd": 287.52550000000167, "cap_midpoint_usd": 287.95650000000205}
+{"window": "5h", "tick_from": 0.09, "tick_to": 0.1, "start_label": "092-after", "end_label": "126-after", "cap_pre_usd": 299.0045000000016, "cap_post_usd": 299.0045000000016, "cap_midpoint_usd": 299.0045000000016}
+{"window": "7d", "tick_from": 0.99, "tick_to": 1.0, "start_label": "030-after", "end_label": "140-after", "cap_pre_usd": 1580.2130000000047, "cap_post_usd": 1572.7940000000049, "cap_midpoint_usd": 1576.503500000005}

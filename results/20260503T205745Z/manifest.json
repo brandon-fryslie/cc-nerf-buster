@@ -1,0 +1,53 @@
+{
+  "started": "20260503T205745Z",
+  "metrics_url": "http://localhost:58373/metrics",
+  "model": "claude-opus-4-7",
+  "window": "both",
+  "target_5h_ticks": 3,
+  "target_7d_ticks": 1,
+  "required_crossings_5h": 4,
+  "required_crossings_7d": 2,
+  "baseline_zero_5h": false,
+  "baseline_zero_7d": false,
+  "dry_run": false,
+  "dry_iterations": 3,
+  "baseline": {
+    "label": "000-baseline",
+    "ts": "2026-05-03T20:57:45Z",
+    "org": "51dc129f-1e02-4826-af48-24c47982a037",
+    "upstream": "api.anthropic.com",
+    "util_5h": 0.01,
+    "util_7d": 0.98,
+    "cost_total": 0.14493,
+    "capacity_usd_5h": 212.20798571428566,
+    "capacity_usd_7d": 413.7801499999995,
+    "no_model_input_tokens": 0.0,
+    "no_model_output_tokens": 0.0,
+    "model_requests": 1,
+    "model_input_tokens": 6,
+    "model_output_tokens": 6,
+    "model_cache_creation_input_tokens": 14475,
+    "model_cache_read_input_tokens": 0
+  },
+  "prompt_stats": {
+    "large": {
+      "chars": 550056,
+      "words": 83315
+    },
+    "medium": {
+      "chars": 25582,
+      "words": 3882
+    },
+    "small": {
+      "chars": 3234,
+      "words": 485
+    },
+    "micro": {
+      "chars": -1,
+      "words": -1
+    }
+  },
+  "system_prompt": "",
+  "estimated_input_equiv_tokens_per_tick_5h": 550623.0,
+  "estimated_input_equiv_tokens_per_tick_7d": 2753115.0
+}

@@ -1,0 +1,3 @@
+{"window": "5h", "tick_from": 0.11, "tick_to": 0.12, "start_label": "001-after", "end_label": "026-after", "cap_pre_usd": 292.71225000000027, "cap_post_usd": 264.7092500000003, "cap_midpoint_usd": 278.7107500000003}
+{"window": "5h", "tick_from": 0.12, "tick_to": 0.13, "start_label": "026-after", "end_label": "056-after", "cap_pre_usd": 295.5335000000006, "cap_post_usd": 295.5335000000006, "cap_midpoint_usd": 295.53350000000063}
+{"window": "5h", "tick_from": 0.13, "tick_to": 0.14, "start_label": "056-after", "end_label": "088-after", "cap_pre_usd": 302.98399999999964, "cap_post_usd": 302.9839999999996, "cap_midpoint_usd": 302.98399999999964}
