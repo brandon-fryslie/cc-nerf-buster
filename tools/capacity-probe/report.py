@@ -293,11 +293,19 @@ def main(run_dir: Path, print_bounds: bool) -> None:
     push(f"- Model pinned:  `{manifest['model']}`")
     push(f"- Metrics URL:   `{manifest['metrics_url']}`")
     push(f"- Iterations:    {len(iters)}")
-    push(f"- Window:        `{manifest.get('window', 'both')}`")
-    req_5h = manifest.get("required_crossings_5h", int(manifest.get("target_5h_ticks", 0)) + 1)
-    req_7d = manifest.get("required_crossings_7d", int(manifest["target_7d_ticks"]) + 1)
-    push(f"- Target 5h ticks: {manifest.get('target_5h_ticks', '—')} (needs {req_5h} crossings)")
-    push(f"- Target 7d ticks: {manifest['target_7d_ticks']} (needs {req_7d} crossings)")
+    window = manifest.get("window", "—")
+    push(f"- Window:        `{window}`")
+    # New (single-window) manifest format uses target_ticks / required_crossings.
+    # Older both-mode runs used target_{5h,7d}_ticks / required_crossings_{5h,7d};
+    # render whichever form the manifest provides so historical reports keep working.
+    if "target_ticks" in manifest:
+        req = int(manifest.get("required_crossings", int(manifest["target_ticks"]) + 1))
+        push(f"- Target {window} ticks: {manifest['target_ticks']} (needs {req} crossings)")
+    else:
+        req_5h = manifest.get("required_crossings_5h", int(manifest.get("target_5h_ticks", 0)) + 1)
+        req_7d = manifest.get("required_crossings_7d", int(manifest.get("target_7d_ticks", 0)) + 1)
+        push(f"- Target 5h ticks: {manifest.get('target_5h_ticks', '—')} (needs {req_5h} crossings)")
+        push(f"- Target 7d ticks: {manifest.get('target_7d_ticks', '—')} (needs {req_7d} crossings)")
     push(f"- Observed 5h crossings: {len(crossings_5h)} → {len(ticks_5h)} clean measured tick(s)")
     push(f"- Observed 7d crossings: {len(crossings_7d)} → {len(ticks_7d)} clean measured tick(s)")
     push("")

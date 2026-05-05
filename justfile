@@ -26,21 +26,24 @@ install *ARGS:
 uninstall:
     ./scripts/uninstall.sh
 
-# Capacity probe: measure both 5h and 7d (stops when both hit their tick targets).
-probe *ARGS:
-    cd tools/capacity-probe && bash probe.sh --window=both {{ARGS}}
-
-# Capacity probe: 5h only.
+# Note: each probe run targets exactly one window — a single prompt-size knob
+# cannot satisfy both 5h and 7d tick boundaries at the same time.
+#
+# Capacity probe: 5h window.
 probe-5h *ARGS:
-    cd tools/capacity-probe && bash probe.sh --window=5h {{ARGS}}
+    cd tools/capacity-probe && bash with-proxy.sh --window=5h {{ARGS}}
 
-# Capacity probe: 7d only.
+# Capacity probe: 7d window.
 probe-7d *ARGS:
-    cd tools/capacity-probe && bash probe.sh --window=7d {{ARGS}}
+    cd tools/capacity-probe && bash with-proxy.sh --window=7d {{ARGS}}
 
-# Capacity probe: dry-run. Exercises every code path with `echo` replacing `claude`.
-probe-dry *ARGS:
-    cd tools/capacity-probe && bash probe.sh --dry-run {{ARGS}}
+# Capacity probe dry-run, 5h: exercises every code path with `echo` replacing `claude`.
+probe-dry-5h *ARGS:
+    cd tools/capacity-probe && bash with-proxy.sh --dry-run --window=5h {{ARGS}}
+
+# Capacity probe dry-run, 7d: exercises every code path with `echo` replacing `claude`.
+probe-dry-7d *ARGS:
+    cd tools/capacity-probe && bash with-proxy.sh --dry-run --window=7d {{ARGS}}
 
 # Regenerate report.md from an existing capacity-probe run directory.
 probe-report RUN_DIR:

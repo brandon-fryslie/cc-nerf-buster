@@ -20,11 +20,14 @@ The notes describe normal service activity.
 Do not add anything else.
 """
 
+# Sizes calibrated against measured cost on Opus 4.7 (~0.75 input-equiv per
+# prompt char, dominated by cache_write × 2). At ~550k input-equiv per 1%
+# tick: large lands ~75% of a tick, medium ~3%, small ~1%. Micro is dynamic.
 PROMPT_CHAR_TARGETS = {
-    "large": 100_000,
-    "medium": 36_000,
-    "small": 10_000,
-    "micro": 3_000,
+    "large": 550_000,
+    "medium": 25_000,
+    "small": 3_000,
+    "micro": 200,
 }
 
 PROMPT_PARAGRAPHS = (
@@ -51,18 +54,52 @@ def build_prompt_corpus(target_chars: int) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+# Output is ~15 tokens at 5x weighting = a fixed ~75 input-equiv floor every
+# call regardless of prompt size. Anthropic begins cache-writing (×2) at ~1024
+# input tokens, so we keep micro strictly below that to stay on plain-input
+# pricing — each input token costs 1 input-equiv, ~3.6 chars per token.
+MICRO_OUTPUT_FLOOR = 75.0
+MICRO_CACHE_THRESHOLD_TOKENS = 900
+MICRO_CHARS_PER_TOKEN = 3.6
+MICRO_BASE = "Reply with: ok.\n"
+MICRO_FILLER = "Note: routine operational sample data point. "
+
+
+def build_micro_prompt(target_input_equiv: float) -> str:
+    target_input_tokens = max(3.0, target_input_equiv - MICRO_OUTPUT_FLOOR)
+    target_input_tokens = min(target_input_tokens, MICRO_CACHE_THRESHOLD_TOKENS)
+    target_chars = int(target_input_tokens * MICRO_CHARS_PER_TOKEN)
+    if target_chars <= len(MICRO_BASE):
+        return MICRO_BASE
+    repeats = (target_chars - len(MICRO_BASE)) // len(MICRO_FILLER) + 1
+    body = (MICRO_FILLER * repeats)[: target_chars - len(MICRO_BASE)]
+    return MICRO_BASE + body + "\n"
+
+
 PROMPTS = {
     name: build_prompt_corpus(target_chars)
     for name, target_chars in PROMPT_CHAR_TARGETS.items()
+    if name != "micro"
 }
 
 PROMPT_STATS = {
     name: {"chars": len(text), "words": len(text.split())}
     for name, text in PROMPTS.items()
 }
+PROMPT_STATS["micro"] = {"chars": -1, "words": -1}  # dynamic, sized per call
 
-DEFAULT_5H_INPUT_EQUIV_PER_TICK = 74543.815
-DEFAULT_7D_INPUT_EQUIV_PER_TICK = 400000.0
+# // [LAW:one-source-of-truth] per-window defaults live in one map keyed by
+# the window string. Every site that needs a per-window default reads from
+# here — there is no separate constant per window to drift out of sync.
+WINDOW_CHOICES = ("5h", "7d")
+DEFAULT_INPUT_EQUIV_PER_TICK = {
+    "5h": 550_623.0,
+    "7d": 550_623.0 * 5,
+}
+DEFAULT_TARGET_TICKS = {
+    "5h": 3,
+    "7d": 1,
+}
 
 OUTPUT_TO_INPUT_EQUIV = 5.0
 CACHE_CREATE_TO_INPUT_EQUIV = 2.0
@@ -83,8 +120,32 @@ def run_ts() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+_USE_COLOR = sys.stderr.isatty()
+
+
+def _c(s: object, code: str) -> str:
+    if not _USE_COLOR:
+        return str(s)
+    return f"\033[{code}m{s}\033[0m"
+
+
+def bold(s: object) -> str: return _c(s, "1")
+def dim(s: object) -> str: return _c(s, "2")
+def red(s: object) -> str: return _c(s, "31")
+def green(s: object) -> str: return _c(s, "32")
+def yellow(s: object) -> str: return _c(s, "33")
+def blue(s: object) -> str: return _c(s, "34")
+def magenta(s: object) -> str: return _c(s, "35")
+def cyan(s: object) -> str: return _c(s, "36")
+
+
 def log(msg: str) -> None:
-    print(f"[probe {datetime.now(UTC).strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
+    ts = datetime.now(UTC).strftime("%H:%M:%S")
+    print(f"{dim(f'[{ts}]')} {msg}", file=sys.stderr)
+
+
+def log_raw(msg: str) -> None:
+    print(msg, file=sys.stderr)
 
 
 def die(msg: str) -> "NoReturn":
@@ -95,7 +156,10 @@ def die(msg: str) -> "NoReturn":
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--window", choices=("5h", "7d", "both"), default="both")
+    # // [LAW:one-type-per-behavior] one window per run. The "both" mode used
+    # to exist but was fundamentally broken: a single prompt-size knob cannot
+    # binary-search two tick boundaries with different per-tick costs at once.
+    p.add_argument("--window", choices=WINDOW_CHOICES, required=True)
     p.add_argument("--resume", default=None)
     p.add_argument("--continue", dest="continue_latest", action="store_true")
     args = p.parse_args()
@@ -118,7 +182,7 @@ def parse_gauge(metrics_text: str, name: str) -> float:
     for line in metrics_text.splitlines():
         if line.startswith(prefix_a) or line.startswith(prefix_b):
             return float(line.rsplit(" ", 1)[-1])
-    die(f"metric {name} not found")
+    return 0.0
 
 
 def parse_metric_line(line: str) -> tuple[str, dict[str, str], float] | None:
@@ -158,11 +222,13 @@ def matching_series(metrics_text: str, metric_name: str, required_labels: dict[s
 
 
 def canonical_metric_scope(metrics_text: str, model: str) -> dict[str, str]:
-    series = matching_series(metrics_text, "ccnb_requests_total", {"model": model})
-    if not series:
-        die(f"metric ccnb_requests_total for model {model} not found")
     # [LAW:one-source-of-truth] the active model request series defines the
     # org/upstream identity for the rest of the probe's metrics snapshot.
+    # A fresh proxy has no series yet — return an empty scope so the snapshot
+    # reads zeros uniformly instead of branching on "is the proxy fresh?".
+    series = matching_series(metrics_text, "ccnb_requests_total", {"model": model})
+    if not series:
+        return {}
     labels, _value = max(series, key=lambda item: item[1])
     scope = {key: labels[key] for key in ("org", "upstream") if key in labels}
     if len(scope) != 2:
@@ -182,9 +248,11 @@ def parse_scoped_counter_total(
 
 
 def parse_scoped_gauge(metrics_text: str, metric_name: str, required_labels: dict[str, str]) -> float:
+    # A fresh proxy has not emitted any scoped series yet; treat absence as 0.0
+    # so the snapshot's value flow is the same on a fresh proxy as on a populated one.
     series = matching_series(metrics_text, metric_name, required_labels)
     if not series:
-        die(f"metric {metric_name} with labels {required_labels} not found")
+        return 0.0
     return series[0][1]
 
 
@@ -195,11 +263,14 @@ def snapshot_metrics(run_dir: Path, metrics_url: str, label: str, model: str) ->
     scope = canonical_metric_scope(raw_text, model)
     model_scope = {"model": model, **scope}
 
+    # Both util_5h and util_7d are emitted by /metrics regardless of which
+    # window the probe is driving — capturing both keeps the report.py view
+    # informative without affecting which window controls the loop.
     snap = {
         "label": label,
         "ts": utc_now(),
-        "org": scope["org"],
-        "upstream": scope["upstream"],
+        "org": scope.get("org", ""),
+        "upstream": scope.get("upstream", ""),
         "util_5h": parse_scoped_gauge(raw_text, "ccnb_quota_5h_utilization", scope),
         "util_7d": parse_scoped_gauge(raw_text, "ccnb_quota_7d_utilization", scope),
         "cost_total": parse_scoped_gauge(raw_text, "ccnb_cost_total", scope),
@@ -236,29 +307,17 @@ def input_price_per_mtok(model: str) -> float:
 
 
 def choose_prompt_size(
-    window: str,
-    ticks_5h: int,
-    ticks_7d: int,
-    need_5h: int,
-    need_7d: int,
-    est_units_5h: float,
-    est_units_7d: float,
-    used_units_5h: float,
-    used_units_7d: float,
-) -> tuple[str, str, float]:
-    candidates: list[tuple[str, float]] = []
-    if window in ("5h", "both") and ticks_5h < need_5h and est_units_5h > 0:
-        candidates.append(("5h", max(0.0, est_units_5h - used_units_5h)))
-    if window in ("7d", "both") and ticks_7d < need_7d and est_units_7d > 0:
-        candidates.append(("7d", max(0.0, est_units_7d - used_units_7d)))
-    if not candidates:
-        return ("5h" if window != "7d" else "7d", "large", 0.0)
-
-    control_window, remaining_units = min(candidates, key=lambda item: item[1])
-    est_units = est_units_5h if control_window == "5h" else est_units_7d
-    remaining_ratio = remaining_units / est_units if est_units > 0 else 1.0
+    ticks_seen: int,
+    need: int,
+    est_units_per_tick: float,
+    used_units_since_tick: float,
+) -> tuple[str, float]:
     # // [LAW:dataflow-not-control-flow] every iteration follows the same
     # choose-build-send-measure sequence; only the prompt size value changes.
+    if ticks_seen >= need or est_units_per_tick <= 0:
+        return ("large", 0.0)
+    remaining_units = max(0.0, est_units_per_tick - used_units_since_tick)
+    remaining_ratio = remaining_units / est_units_per_tick
     if remaining_ratio > 0.50:
         size = "large"
     elif remaining_ratio > 0.20:
@@ -267,20 +326,12 @@ def choose_prompt_size(
         size = "small"
     else:
         size = "micro"
-    return control_window, size, remaining_units
+    return size, remaining_units
 
 
-def target_met(window: str, ticks_5h: int, ticks_7d: int, need_5h: int, need_7d: int) -> bool:
-    met_5h = ticks_5h >= need_5h
-    met_7d = ticks_7d >= need_7d
-    if window == "5h":
-        return met_5h
-    if window == "7d":
-        return met_7d
-    return met_5h and met_7d
-
-
-def build_prompt(size_name: str) -> str:
+def build_prompt(size_name: str, micro_target_input_equiv: float = 0.0) -> str:
+    if size_name == "micro":
+        return build_micro_prompt(micro_target_input_equiv)
     return PROMPTS[size_name]
 
 
@@ -308,16 +359,8 @@ def fatal_output_reason(text: str) -> str | None:
     return None
 
 
-def resume_command(window: str) -> str:
-    return resume_command_for_run(window, None)
-
-
 def resume_command_for_run(window: str, run_dir: Path | None) -> str:
-    recipe = {
-        "both": "probe",
-        "5h": "probe-5h",
-        "7d": "probe-7d",
-    }[window]
+    recipe = {"5h": "probe-5h", "7d": "probe-7d"}[window]
     if run_dir is None:
         return f"just {recipe}"
     return f"just {recipe} --resume {run_dir}"
@@ -328,6 +371,86 @@ def run_report(script_dir: Path, run_dir: Path) -> None:
         [sys.executable, str(script_dir / "report.py"), "--print-bounds", str(run_dir)],
         check=True,
     )
+
+
+def find_previous_run(data_dir: Path, current_run_dir: Path, window: str) -> Path | None:
+    runs_dir = data_dir / "probe-runs"
+    if not runs_dir.exists():
+        return None
+    candidates: list[Path] = []
+    for child in runs_dir.iterdir():
+        if not child.is_dir() or child == current_run_dir:
+            continue
+        if child.name.startswith("dryrun-"):
+            continue
+        if not (child / "bounds.json").exists():
+            continue
+        manifest_path = child / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        # Only compare to runs that were driven against the same window —
+        # otherwise the comparison is across measurement targets and
+        # misleading.
+        if manifest.get("window") != window:
+            continue
+        candidates.append(child)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.name)
+
+
+def fmt_delta(curr: float | None, prev: float | None, unit: str = "") -> str:
+    if curr is None or prev is None or prev == 0:
+        return dim("(no comparison)")
+    delta = curr - prev
+    pct = (delta / prev) * 100
+    arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "·")
+    sign = "+" if delta >= 0 else ""
+    body = f"{arrow} {sign}{delta:,.0f}{unit} ({sign}{pct:.1f}%)"
+    if abs(pct) < 1.0:
+        return green(body)
+    if abs(pct) < 5.0:
+        return yellow(body)
+    return red(body)
+
+
+def print_comparison(run_dir: Path, data_dir: Path, window: str) -> None:
+    cur_path = run_dir / "bounds.json"
+    if not cur_path.exists():
+        return
+    prev_run = find_previous_run(data_dir, run_dir, window)
+    log_raw("")
+    log_raw(bold(f"=== Comparison to previous {window} run ==="))
+    if prev_run is None:
+        log_raw(dim(f"  (no previous non-dry-run with bounds.json found for window {window})"))
+        return
+    cur = json.loads(cur_path.read_text())
+    prev = json.loads((prev_run / "bounds.json").read_text())
+    log_raw(f"  previous run directory: {dim(prev_run.name)}")
+    cw = cur["windows"].get(window, {})
+    pw = prev["windows"].get(window, {})
+    cur_ticks = cw.get("clean_measured_ticks", 0)
+    prev_ticks = pw.get("clean_measured_ticks", 0)
+    cur_usd = (cw.get("weighted_usd") or {}).get("midpoint")
+    prev_usd = (pw.get("weighted_usd") or {}).get("midpoint")
+    cur_opus = ((cw.get("tokens") or {}).get("midpoint") or {}).get("opus", {}).get("input_per_tick")
+    prev_opus = ((pw.get("tokens") or {}).get("midpoint") or {}).get("opus", {}).get("input_per_tick")
+    log_raw(f"  {bold(window)} window:")
+    log_raw(f"    clean measured ticks: {cur_ticks} this run, {prev_ticks} previous run")
+    if cur_usd is not None and prev_usd is not None:
+        log_raw(
+            f"    weighted-USD per 1% tick: {bold(f'{cur_usd:.2f}')} this run, "
+            f"{prev_usd:.2f} previous run    change: {fmt_delta(cur_usd, prev_usd, ' USD')}"
+        )
+    if cur_opus is not None and prev_opus is not None:
+        log_raw(
+            f"    Opus input tokens per 1% tick: {bold(f'{cur_opus:,}')} this run, "
+            f"{prev_opus:,} previous run    change: {fmt_delta(cur_opus, prev_opus, ' tokens')}"
+        )
 
 
 def copy_with_hashes(run_dir: Path, script_dir: Path) -> None:
@@ -346,7 +469,9 @@ def copy_with_hashes(run_dir: Path, script_dir: Path) -> None:
 
 def claude_env(data_dir: Path) -> dict[str, str]:
     ca_cert = data_dir / "ca.crt"
-    proxy_url = "http://localhost:9480"
+    # [LAW:one-source-of-truth] PROXY_URL is set by the wrapper that owns the
+    # cc-nerf-buster process; the probe just consumes it.
+    proxy_url = os.environ.get("PROXY_URL", "http://localhost:9480")
     env = dict(os.environ)
     # [LAW:single-enforcer] the probe owns the Claude subprocess environment so
     # every probe request goes through the same proxy/CA boundary.
@@ -377,22 +502,23 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def load_resume_state(run_dir: Path) -> tuple[dict, dict, int, float, float]:
+def load_resume_state(run_dir: Path, window: str) -> tuple[dict, dict, int, float]:
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
         die(f"resume run missing manifest: {manifest_path}")
 
     manifest = json.loads(manifest_path.read_text())
+    if manifest.get("window") != window:
+        die(f"resume mismatch: run was --window={manifest.get('window')!r}, you passed --window={window!r}")
     baseline = manifest["baseline"]
-    est_units_per_tick_5h = float(manifest["estimated_input_equiv_tokens_per_tick_5h"])
-    est_units_per_tick_7d = float(manifest["estimated_input_equiv_tokens_per_tick_7d"])
+    est_units_per_tick = float(manifest["estimated_input_equiv_tokens_per_tick"])
+    util_key = f"util_{window}"
 
     snapshots = {row["label"]: row for row in load_jsonl(run_dir / "snapshots.jsonl")}
     iterations = load_jsonl(run_dir / "iterations.jsonl")
 
     current = baseline
-    used_units_since_5h_tick = 0.0
-    used_units_since_7d_tick = 0.0
+    used_units_since_tick = 0.0
 
     for row in iterations:
         label = f"{int(row['iter']):03d}-after"
@@ -401,19 +527,13 @@ def load_resume_state(run_dir: Path) -> tuple[dict, dict, int, float, float]:
             break
 
         iter_units = float(row["input_equivalent_tokens"])
-        prev_ticks_5h = tick_delta(current["util_5h"], baseline["util_5h"])
-        prev_ticks_7d = tick_delta(current["util_7d"], baseline["util_7d"])
-        new_ticks_5h = tick_delta(snap["util_5h"], baseline["util_5h"])
-        new_ticks_7d = tick_delta(snap["util_7d"], baseline["util_7d"])
-        crossed_5h = max(0, new_ticks_5h - prev_ticks_5h)
-        crossed_7d = max(0, new_ticks_7d - prev_ticks_7d)
+        prev_ticks = tick_delta(current[util_key], baseline[util_key])
+        new_ticks = tick_delta(snap[util_key], baseline[util_key])
+        crossed = max(0, new_ticks - prev_ticks)
 
-        used_units_since_5h_tick += iter_units
-        used_units_since_7d_tick += iter_units
-        if crossed_5h > 0 and est_units_per_tick_5h > 0:
-            used_units_since_5h_tick = max(0.0, used_units_since_5h_tick - est_units_per_tick_5h * crossed_5h)
-        if crossed_7d > 0 and est_units_per_tick_7d > 0:
-            used_units_since_7d_tick = max(0.0, used_units_since_7d_tick - est_units_per_tick_7d * crossed_7d)
+        used_units_since_tick += iter_units
+        if crossed > 0 and est_units_per_tick > 0:
+            used_units_since_tick = max(0.0, used_units_since_tick - est_units_per_tick * crossed)
 
         current = snap
 
@@ -421,7 +541,7 @@ def load_resume_state(run_dir: Path) -> tuple[dict, dict, int, float, float]:
     if iterations:
         next_iter = int(iterations[-1]["iter"]) + 1
 
-    return current, baseline, next_iter, used_units_since_5h_tick, used_units_since_7d_tick
+    return current, baseline, next_iter, used_units_since_tick
 
 
 def resolve_continue_run(data_dir: Path, window: str, dry_run: bool) -> Path:
@@ -454,16 +574,20 @@ def resolve_continue_run(data_dir: Path, window: str, dry_run: bool) -> Path:
 
 def main() -> None:
     args = parse_args()
+    window = args.window
+    util_key = f"util_{window}"
+    other_window = "7d" if window == "5h" else "5h"
 
     metrics_url = os.environ.get("METRICS_URL", "http://localhost:9481/metrics")
     data_dir = Path(os.environ.get("DATA_DIR", str(Path.home() / ".local" / "cc-nerf-buster")))
     model = os.environ.get("MODEL", "claude-opus-4-7")
-    target_5h_ticks = int(os.environ.get("TARGET_5H_TICKS", "3"))
-    target_7d_ticks = int(os.environ.get("TARGET_7D_TICKS", "1"))
+    target_env = f"TARGET_{window.upper()}_TICKS"
+    estimate_env = f"ESTIMATE_{window.upper()}_INPUT_EQUIV_PER_TICK"
+    target_ticks = int(os.environ.get(target_env, str(DEFAULT_TARGET_TICKS[window])))
     dry_iterations = int(os.environ.get("DRY_ITERATIONS", "3"))
 
     if args.continue_latest:
-        args.resume = str(resolve_continue_run(data_dir, args.window, args.dry_run))
+        args.resume = str(resolve_continue_run(data_dir, window, args.dry_run))
 
     script_dir = Path(__file__).resolve().parent
     ts = run_ts()
@@ -472,14 +596,9 @@ def main() -> None:
     (run_dir / "prompts").mkdir(parents=True, exist_ok=True)
     (run_dir / "claude-output").mkdir(parents=True, exist_ok=True)
 
-    if args.window == "5h":
-        log(f"window: 5h only (target: {target_5h_ticks} tick(s))")
-    elif args.window == "7d":
-        log(f"window: 7d only (target: {target_7d_ticks} tick(s))")
-    else:
-        log(f"window: both (target: 5h={target_5h_ticks}, 7d={target_7d_ticks})")
+    log(f"target: {target_ticks} ticks on the {window} window")
     if args.dry_run:
-        log(f"DRY RUN: 'echo' replaces 'claude'; stopping after {dry_iterations} iteration(s). No API calls will be made.")
+        log(f"DRY RUN: 'echo' replaces 'claude'; will stop after {dry_iterations} iterations. No API calls will be made.")
 
     try:
         fetch_metrics(metrics_url)
@@ -492,58 +611,73 @@ def main() -> None:
 
     if args.resume:
         manifest = json.loads((run_dir / "manifest.json").read_text())
+        if manifest.get("window") != window:
+            die(f"resume mismatch: run was --window={manifest.get('window')!r}, you passed --window={window!r}")
         baseline = manifest["baseline"]
-        baseline_zero_5h = bool(manifest["baseline_zero_5h"])
-        baseline_zero_7d = bool(manifest["baseline_zero_7d"])
-        need_5h = int(manifest["required_crossings_5h"])
-        need_7d = int(manifest["required_crossings_7d"])
-        est_units_per_tick_5h = float(manifest["estimated_input_equiv_tokens_per_tick_5h"])
-        est_units_per_tick_7d = float(manifest["estimated_input_equiv_tokens_per_tick_7d"])
-        current, baseline, next_iter, used_units_since_5h_tick, used_units_since_7d_tick = load_resume_state(run_dir)
+        baseline_zero = bool(manifest["baseline_zero"])
+        need = int(manifest["required_crossings"])
+        est_units_per_tick = float(manifest["estimated_input_equiv_tokens_per_tick"])
+        current, baseline, next_iter, used_units_since_tick = load_resume_state(run_dir, window)
         log(
             f"resuming run: {run_dir} "
-            f"(next_iter={next_iter:03d}, used_5h={used_units_since_5h_tick:.1f}, used_7d={used_units_since_7d_tick:.1f})"
+            f"(next_iter={next_iter:03d}, used_since_tick={used_units_since_tick:.1f})"
         )
     else:
         log("fetching baseline snapshot")
         baseline = snapshot_metrics(run_dir, metrics_url, "000-baseline", model)
-        baseline_zero_5h = is_zero_util(baseline["util_5h"])
-        baseline_zero_7d = is_zero_util(baseline["util_7d"])
-        need_5h = target_5h_ticks + 1 - int(baseline_zero_5h)
-        need_7d = target_7d_ticks + 1 - int(baseline_zero_7d)
-        input_price = input_price_per_mtok(model)
-        est_units_per_tick_5h = baseline["capacity_usd_5h"] * 0.01 * 1_000_000.0 / input_price
-        est_units_per_tick_7d = baseline["capacity_usd_7d"] * 0.01 * 1_000_000.0 / input_price
-        if est_units_per_tick_5h <= 0:
-            est_units_per_tick_5h = float(os.environ.get("ESTIMATE_5H_INPUT_EQUIV_PER_TICK", str(DEFAULT_5H_INPUT_EQUIV_PER_TICK)))
-        if est_units_per_tick_7d <= 0:
-            est_units_per_tick_7d = float(os.environ.get("ESTIMATE_7D_INPUT_EQUIV_PER_TICK", str(DEFAULT_7D_INPUT_EQUIV_PER_TICK)))
+        baseline_zero = is_zero_util(baseline[util_key])
+        need = target_ticks + 1 - int(baseline_zero)
+        # // [LAW:one-source-of-truth] the measured per-tick value (from a real
+        # probe run on this account) is the initial estimate; the proxy's
+        # capacity_usd guess was off by ~7x in practice. Refinement from
+        # observed crossings (in the iteration loop) replaces this as soon
+        # as we have one real data point.
+        est_units_per_tick = float(os.environ.get(estimate_env, str(DEFAULT_INPUT_EQUIV_PER_TICK[window])))
 
         manifest = {
             "started": ts,
             "metrics_url": metrics_url,
             "model": model,
-            "window": args.window,
-            "target_5h_ticks": target_5h_ticks,
-            "target_7d_ticks": target_7d_ticks,
-            "required_crossings_5h": need_5h,
-            "required_crossings_7d": need_7d,
-            "baseline_zero_5h": baseline_zero_5h,
-            "baseline_zero_7d": baseline_zero_7d,
+            "window": window,
+            "target_ticks": target_ticks,
+            "required_crossings": need,
+            "baseline_zero": baseline_zero,
             "dry_run": args.dry_run,
             "dry_iterations": dry_iterations,
             "baseline": baseline,
             "prompt_stats": PROMPT_STATS,
             "system_prompt": "",
-            "estimated_input_equiv_tokens_per_tick_5h": est_units_per_tick_5h,
-            "estimated_input_equiv_tokens_per_tick_7d": est_units_per_tick_7d,
+            "estimated_input_equiv_tokens_per_tick": est_units_per_tick,
         }
         (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
         current = baseline
-        used_units_since_5h_tick = 0.0
-        used_units_since_7d_tick = 0.0
+        used_units_since_tick = 0.0
         next_iter = 1
+
+    # Cumulative measurements drive estimate refinement: per-tick = total
+    # input-equiv consumed / total ticks crossed, replacing the initial
+    # estimate with ground truth as soon as we have any.
+    observed_units = 0.0
+    observed_ticks = 0
+
+    cmd_preview = (
+        f"claude -p --model {model} --system-prompt '' --no-session-persistence --tools '' --"
+        if not args.dry_run
+        else "python3 -c 'echo'"
+    )
+    log(f"model: {model}")
+    log(f"proxy scope: organization {baseline['org'] or '(none yet)'}, upstream {baseline['upstream'] or '(none yet)'}")
+    log(
+        f"baseline utilization: "
+        f"{window} window {int(baseline[util_key]*100+1e-9)}% (driven), "
+        f"{other_window} window {int(baseline[f'util_{other_window}']*100+1e-9)}% (informational)"
+    )
+    log(
+        f"initial estimate of input-equivalent tokens per 1% tick "
+        f"({window}): ≈ {est_units_per_tick:,.0f}"
+    )
+    log(f"command run per iteration: {cmd_preview} <prompt>")
 
     interrupted = False
 
@@ -555,13 +689,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_interrupt)
     signal.signal(signal.SIGTERM, handle_interrupt)
 
-    ticks_5h = tick_delta(current["util_5h"], baseline["util_5h"])
-    ticks_7d = tick_delta(current["util_7d"], baseline["util_7d"])
-    if target_met(args.window, ticks_5h, ticks_7d, need_5h, need_7d):
-        log(
-            f"resume target already reached: 5h {ticks_5h}/{need_5h}, "
-            f"7d {ticks_7d}/{need_7d}"
-        )
+    ticks_seen = tick_delta(current[util_key], baseline[util_key])
+    if ticks_seen >= need:
+        log(f"resume target already reached: {window} {ticks_seen}/{need}")
         log("running report.py")
         run_report(script_dir, run_dir)
         log(f"run complete: {run_dir}")
@@ -573,36 +703,34 @@ def main() -> None:
             break
 
         n = f"{iter_num:03d}"
-        ticks_5h = tick_delta(current["util_5h"], baseline["util_5h"])
-        ticks_7d = tick_delta(current["util_7d"], baseline["util_7d"])
-        control_window, size_name, rem = choose_prompt_size(
-            args.window,
-            ticks_5h,
-            ticks_7d,
-            need_5h,
-            need_7d,
-            est_units_per_tick_5h,
-            est_units_per_tick_7d,
-            used_units_since_5h_tick,
-            used_units_since_7d_tick,
+        ticks_seen = tick_delta(current[util_key], baseline[util_key])
+        size_name, rem = choose_prompt_size(
+            ticks_seen, need, est_units_per_tick, used_units_since_tick
         )
 
-        prompt = f"Probe timestamp: {utc_now()}\n" + build_prompt(size_name)
+        # Timestamp at the START so each call has a unique prefix and pays
+        # full cache_write cost — that's how a `large` prompt actually consumes
+        # large quota per call. Caching the corpus would let large cache_read
+        # at ~10% the cost, defeating its purpose. Micro stays below the cache
+        # threshold so it skips caching naturally and is sized dynamically to
+        # the remaining distance to the next tick boundary.
+        # Target HALF the remaining distance so micro just barely doesn't
+        # cross — binary-search the boundary. Each non-crossing iter halves
+        # the gap; eventually the smallest meaningful prompt (~80 input-equiv
+        # output floor) finally tips us over with minimal overshoot.
+        prompt_corpus = build_prompt(size_name, micro_target_input_equiv=rem * 0.5)
+        prompt = f"Probe timestamp: {utc_now()}\n" + prompt_corpus
         prompt_path = run_dir / "prompts" / f"{n}.txt"
         prompt_path.write_text(prompt)
         output_path = run_dir / "claude-output" / f"{n}.txt"
 
         cmd_name = "python3" if args.dry_run else "claude"
-        cmd = [cmd_name]
-        cmd_desc = cmd_name
         if not args.dry_run:
             # [LAW:single-enforcer] `--` is the single boundary that stops the
             # variadic `--tools` option from consuming the positional prompt.
             cmd = [cmd_name, "-p", "--model", model, "--system-prompt", "", "--no-session-persistence", "--tools", "", "--", prompt]
-            cmd_desc = f"{cmd_name} -p --model {model} --system-prompt '' --"
         else:
             cmd = [cmd_name, "-c", "import sys; print(sys.argv[1])", prompt]
-        log(f"iter {n}: {cmd_desc} ({size_name}, remaining_tick={rem:.3f} on {control_window})")
 
         start = time.time_ns()
         proc = subprocess.Popen(
@@ -618,7 +746,22 @@ def main() -> None:
         output_path.write_text(completed.stdout)
         output_summary = summarize_output(completed.stdout)
 
-        snap = snapshot_metrics(run_dir, metrics_url, f"{n}-after", model)
+        if interrupted:
+            log("interrupt received during iteration; skipping post-call metrics snapshot and exiting")
+            log("running report.py with data captured before interrupt")
+            run_report(script_dir, run_dir)
+            print_comparison(run_dir, data_dir, window)
+            log(f"resume with: {resume_command_for_run(window, run_dir)}")
+            return
+
+        try:
+            snap = snapshot_metrics(run_dir, metrics_url, f"{n}-after", model)
+        except Exception as exc:
+            log(f"metrics endpoint unreachable after iteration {iter_num} ({exc}); proxy likely shut down — running report on data captured so far")
+            run_report(script_dir, run_dir)
+            print_comparison(run_dir, data_dir, window)
+            log(f"resume with: {resume_command_for_run(window, run_dir)}")
+            return
         usage = {
             "requests": snap["model_requests"] - current["model_requests"],
             "input": snap["model_input_tokens"] - current["model_input_tokens"],
@@ -628,24 +771,21 @@ def main() -> None:
         }
         priced_iter_units = quota_input_equivalent_tokens(usage)
         iter_units = priced_iter_units
-        prev_ticks_5h = tick_delta(current["util_5h"], baseline["util_5h"])
-        prev_ticks_7d = tick_delta(current["util_7d"], baseline["util_7d"])
-        new_ticks_5h = tick_delta(snap["util_5h"], baseline["util_5h"])
-        new_ticks_7d = tick_delta(snap["util_7d"], baseline["util_7d"])
-        crossed_5h = max(0, new_ticks_5h - prev_ticks_5h)
-        crossed_7d = max(0, new_ticks_7d - prev_ticks_7d)
+        prev_ticks = tick_delta(current[util_key], baseline[util_key])
+        new_ticks = tick_delta(snap[util_key], baseline[util_key])
+        crossed = max(0, new_ticks - prev_ticks)
 
-        used_units_since_5h_tick += iter_units
-        used_units_since_7d_tick += iter_units
-        if crossed_5h > 0 and est_units_per_tick_5h > 0:
-            used_units_since_5h_tick = max(0.0, used_units_since_5h_tick - est_units_per_tick_5h * crossed_5h)
-        if crossed_7d > 0 and est_units_per_tick_7d > 0:
-            used_units_since_7d_tick = max(0.0, used_units_since_7d_tick - est_units_per_tick_7d * crossed_7d)
+        used_units_since_tick += iter_units
+        observed_units += iter_units
+        if crossed > 0:
+            observed_ticks += crossed
+            est_units_per_tick = observed_units / observed_ticks
+            used_units_since_tick = max(0.0, used_units_since_tick - est_units_per_tick * crossed)
 
         if interrupted:
             log("running report.py")
             run_report(script_dir, run_dir)
-            log(f"resume with: {resume_command_for_run(args.window, run_dir)}")
+            log(f"resume with: {resume_command_for_run(window, run_dir)}")
             return
 
         iteration = {
@@ -654,9 +794,9 @@ def main() -> None:
             "prompt_file": str(prompt_path),
             "output_file": str(output_path),
             "prompt_size": size_name,
-            "prompt_chars": PROMPT_STATS[size_name]["chars"],
-            "prompt_words": PROMPT_STATS[size_name]["words"],
-            "control_window": control_window,
+            "prompt_chars": len(prompt_corpus),
+            "prompt_words": len(prompt_corpus.split()),
+            "window": window,
             "estimated_remaining_input_equiv_tokens_before_call": rem,
             "exit_code": completed.returncode,
             "wall_ms": wall_ms,
@@ -671,57 +811,69 @@ def main() -> None:
         with (run_dir / "iterations.jsonl").open("a") as f:
             f.write(json.dumps(iteration) + "\n")
 
-        if completed.returncode != 0:
-            log(f"iter {n}: claude exited {completed.returncode}; output={output_summary}")
+        if completed.returncode != 0 and not args.dry_run:
+            log(f"#{n} claude exited {completed.returncode}: {output_summary}")
 
-        if usage["requests"] == 0:
-            log(f"iter {n}: no API requests observed; claude output={output_summary}")
+        if usage["requests"] == 0 and not args.dry_run:
             fatal_reason = fatal_output_reason(completed.stdout)
             # // [LAW:single-enforcer] local CLI failures should be diagnosed at
             # the probe boundary once, instead of silently leaking as zero-usage iterations.
             if fatal_reason is not None:
                 die(f"claude failed locally before any proxied request: {fatal_reason}")
 
-        log(
-            f"iter {n}: req={usage['requests']} "
-            f"in={usage['input']} out={usage['output']} "
-            f"cache_create={usage['cache_create']} cache_read={usage['cache_read']} "
-            f"priced_input_equiv={priced_iter_units:.1f} "
-            f"input_equiv={iter_units:.1f} "
-            f"| util_5h={snap['util_5h']} (+{tick_delta(snap['util_5h'], baseline['util_5h'])}) "
-            f"util_7d={snap['util_7d']} (+{tick_delta(snap['util_7d'], baseline['util_7d'])})"
+        ticks_now = tick_delta(snap[util_key], baseline[util_key])
+        # // [LAW:one-source-of-truth] Anthropic reports util as integer percent;
+        # never display fractional percentages we didn't actually measure.
+        util_pct = int(snap[util_key] * 100 + 1e-9)
+        other_util_pct = int(snap[f"util_{other_window}"] * 100 + 1e-9)
+        next_until_tick = max(0.0, est_units_per_tick - used_units_since_tick)
+
+        crossed_str = green(str(crossed)) if crossed > 0 else dim(str(crossed))
+        total_str = bold(str(ticks_now)) if ticks_now >= need else str(ticks_now)
+
+        log(f"iteration {bold(iter_num)}: prompt size {cyan(size_name)}, took {wall_ms/1000:.1f} seconds")
+        log_raw(
+            f"  {window} window: utilization {yellow(f'{util_pct}%')}, "
+            f"ticks crossed this call: {crossed_str}, "
+            f"ticks crossed total: {total_str} of {need} needed, "
+            f"input-equivalent tokens until next tick: ~{bold(f'{next_until_tick:,.0f}')}"
+        )
+        log_raw(
+            f"  {other_window} window utilization (informational): {yellow(f'{other_util_pct}%')}"
+        )
+        cache_read_str = f"{usage['cache_read']:,}"
+        cache_write_str = f"{usage['cache_create']:,}"
+        log_raw(
+            f"  tokens used this call: "
+            f"input {magenta(usage['input'])}, "
+            f"output {magenta(usage['output'])}, "
+            f"cache read {magenta(cache_read_str)}, "
+            f"cache write {magenta(cache_write_str)} "
+            f"{dim(f'(input-equivalent total: {iter_units:,.0f})')}"
         )
 
         current = snap
-        ticks_5h = tick_delta(current["util_5h"], baseline["util_5h"])
-        ticks_7d = tick_delta(current["util_7d"], baseline["util_7d"])
+        ticks_seen = tick_delta(current[util_key], baseline[util_key])
 
         if args.dry_run:
             if iter_num >= dry_iterations:
-                log(f"DRY RUN: completed {iter_num} iteration(s); stopping (observed {ticks_5h}/{ticks_7d})")
+                log(f"DRY RUN: completed {iter_num} iteration(s); stopping (observed {ticks_seen})")
                 break
             continue
 
-        met_5h = ticks_5h >= need_5h
-        met_7d = ticks_7d >= need_7d
-        if args.window == "5h" and met_5h:
-            log(f"target reached (5h): observed {ticks_5h} crossings (need {need_5h}) → {target_5h_ticks} clean tick(s) across {iter_num} iterations")
-            break
-        if args.window == "7d" and met_7d:
-            log(f"target reached (7d): observed {ticks_7d} crossings (need {need_7d}) → {target_7d_ticks} clean tick(s) across {iter_num} iterations")
-            break
-        if args.window == "both" and met_5h and met_7d:
-            log(f"target reached (both): 5h observed {ticks_5h}/{need_5h} crossings / 7d observed {ticks_7d}/{need_7d} crossings across {iter_num} iterations")
+        if ticks_seen >= need:
+            log(f"target reached ({window}): observed {ticks_seen} crossings (need {need}) → {target_ticks} clean tick(s) across {iter_num} iterations")
             break
 
     if interrupted:
         log("running report.py")
         run_report(script_dir, run_dir)
-        log(f"resume with: {resume_command_for_run(args.window, run_dir)}")
+        log(f"resume with: {resume_command_for_run(window, run_dir)}")
         return
 
     log("running report.py")
     run_report(script_dir, run_dir)
+    print_comparison(run_dir, data_dir, window)
 
     log(f"run complete: {run_dir}")
     print(run_dir)
