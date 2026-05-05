@@ -10,9 +10,16 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.request import urlopen
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.rule import Rule
+from rich.spinner import Spinner
+from rich.text import Text
 
 
 PROMPT_HEADER = """Read the operational notes below and reply with one short sentence:
@@ -104,6 +111,14 @@ DEFAULT_TARGET_TICKS = {
 OUTPUT_TO_INPUT_EQUIV = 5.0
 CACHE_CREATE_TO_INPUT_EQUIV = 2.0
 CACHE_READ_TO_INPUT_EQUIV = 0.10
+
+# // [LAW:one-source-of-truth] OCW (Opus Cache Write equivalent) is the
+# canonical display unit. The internal weighting expresses costs in
+# input-equivalent units (input=1×, output=5×, cache_create=2×); since
+# cache_create is 2× input, OCW = input_equivalent / 2.
+def to_ocw(input_equiv: float) -> float:
+    return input_equiv / CACHE_CREATE_TO_INPUT_EQUIV
+
 
 FATAL_CLAUDE_OUTPUT_PATTERNS = (
     "Not logged in",
@@ -572,6 +587,189 @@ def resolve_continue_run(data_dir: Path, window: str, dry_run: bool) -> Path:
     return max(candidates, key=lambda path: path.name)
 
 
+# --------------------------------------------------------------------------
+# Live iteration UI: per-row data committed to scrollback above a persistent
+# footer (column legend + dynamic status). Implemented with rich.live.Live;
+# inside the Live context, console.print() emits above the live region.
+# --------------------------------------------------------------------------
+
+SIZE_COLOR = {"large": "magenta", "medium": "blue", "small": "cyan", "micro": "yellow"}
+
+
+@dataclass
+class _Col:
+    label: str
+    width: int
+    align: str  # 'l' / 'r' / 'c'
+
+
+# Column widths must accommodate the wider of (label text, max data width).
+_COLS: list[_Col] = [
+    _Col("iter",              4, "r"),
+    _Col("size",              6, "l"),
+    _Col("wall",              5, "r"),
+    _Col("size bar",          8, "l"),
+    _Col("crossings",         9, "r"),
+    _Col("Δ",                 2, "c"),
+    _Col("util %",            7, "l"),
+    _Col("OTHER %",           4, "r"),  # label substituted with the inactive window
+    _Col("Opus Cache Write", 16, "r"),
+]
+_SEP = "  "
+
+
+def _pad(text: str, width: int, align: str) -> str:
+    if align == "l":
+        return text.ljust(width)
+    if align == "r":
+        return text.rjust(width)
+    return text.center(width)
+
+
+def _render_column_labels(other_window: str) -> Text:
+    cols = list(_COLS)
+    cols[7] = _Col(f"{other_window} %", _COLS[7].width, _COLS[7].align)
+    parts = [_pad(c.label, c.width, c.align) for c in cols]
+    return Text(_SEP.join(parts), style="bold dim")
+
+
+def _fmt_iter_row(
+    iter_num: int,
+    size_name: str,
+    wall_s: float,
+    util_pre: int,
+    util_post: int,
+    other_util_pct: int,
+    iter_units: float,
+    est_units_per_tick: float,
+    crossings: int,
+    need: int,
+    crossed_this_call: int,
+) -> Text:
+    bar_w = _COLS[3].width
+    bar_frac = (iter_units / est_units_per_tick) if est_units_per_tick > 0 else 0.0
+    bar_frac = max(0.0, min(1.0, bar_frac))
+    filled = int(round(bar_frac * bar_w))
+    if iter_units > 0 and filled == 0:
+        filled = 1  # always show ≥1 cell for nonzero cost
+
+    iter_ocw = to_ocw(iter_units)
+    size_c = SIZE_COLOR.get(size_name, "white")
+    util_str = f"{util_pre}→{util_post}%"
+    delta_str = "+1" if crossed_this_call > 0 else " ·"
+
+    cells: list[tuple[str, str]] = [
+        (_pad(f"{iter_num}", _COLS[0].width, _COLS[0].align), "bright_black"),
+        (_pad(size_name, _COLS[1].width, _COLS[1].align), size_c),
+        (_pad(f"{wall_s:.1f}s", _COLS[2].width, _COLS[2].align), "bright_black"),
+        ("__BAR__", size_c),
+        (_pad(f"{crossings}/{need}", _COLS[4].width, _COLS[4].align), "bold"),
+        (
+            _pad(delta_str, _COLS[5].width, _COLS[5].align),
+            "bold green" if crossed_this_call > 0 else "bright_black",
+        ),
+        (_pad(util_str, _COLS[6].width, _COLS[6].align), "yellow"),
+        (_pad(f"{other_util_pct}%", _COLS[7].width, _COLS[7].align), "bright_black"),
+        (_pad(f"{int(round(iter_ocw)):,}", _COLS[8].width, _COLS[8].align), "magenta"),
+    ]
+
+    line = Text()
+    for i, (cell, style) in enumerate(cells):
+        if i > 0:
+            line.append(_SEP)
+        if cell == "__BAR__":
+            line.append("█" * filled, style=style)
+            line.append("·" * (bar_w - filled), style="bright_black")
+        else:
+            line.append(cell, style=style)
+    return line
+
+
+@dataclass
+class _FooterState:
+    window: str
+    other_window: str
+    crossings: int = 0
+    need: int = 0
+    cum_input_eq: float = 0.0
+    cum_wall_s: float = 0.0
+    used_since_tick: float = 0.0
+    est_per_tick: float = 0.0
+    in_flight_size: str | None = None
+    target_reached: bool = False
+
+
+class _IterationFooter:
+    """Persistent live footer: column legend + dynamic status + legend."""
+
+    def __init__(self, state: _FooterState) -> None:
+        self.state = state
+        self._spinner = Spinner("dots", style="yellow")
+
+    def update(self, **kwargs: object) -> None:
+        for k, v in kwargs.items():
+            setattr(self.state, k, v)
+
+    def __rich__(self) -> Group:
+        s = self.state
+        until_eq = max(0.0, s.est_per_tick - s.used_since_tick)
+        until_ocw = to_ocw(until_eq)
+        consumed_frac = (s.used_since_tick / s.est_per_tick) if s.est_per_tick > 0 else 0
+        consumed_frac = max(0.0, min(1.0, consumed_frac))
+
+        bar_w = 30
+        filled = int(round(consumed_frac * bar_w))
+        bar = Text()
+        bar.append("█" * filled, style="yellow")
+        bar.append("░" * (bar_w - filled), style="bright_black")
+
+        status = Text("  ")
+        if s.target_reached:
+            status.append("✓", style="bold green")
+            status.append(" target reached  ", style="bold green")
+        elif s.in_flight_size is not None:
+            status.append(self._spinner.render(time.monotonic()))
+            status.append(f" running {s.in_flight_size:<6}", style="yellow")
+        else:
+            status.append("✓", style="green")
+            status.append(f" idle  {'':<6}", style="green")
+        status.append("  ")
+        status.append(bar)
+        status.append("  ≈ ", style="bold")
+        status.append(f"{int(round(until_ocw)):>7,}", style="bold yellow")
+        status.append(" OCW until next tick", style="bold")
+
+        secondary = Text("  ", style="bright_black")
+        secondary.append(f"crossings {s.crossings}/{s.need}")
+        secondary.append("   ·   ")
+        secondary.append(f"cum {int(round(to_ocw(s.cum_input_eq))):,} OCW")
+        secondary.append("   ·   ")
+        secondary.append(f"wall {s.cum_wall_s:.1f}s")
+        secondary.append("   ·   ")
+        secondary.append(f"est/tick ≈ {int(round(to_ocw(s.est_per_tick))):,} OCW")
+
+        legend = Text("  ", style="bright_black")
+        legend.append("OCW", style="bold dim")
+        legend.append(" = Opus Cache Write equivalent tokens", style="dim")
+        legend.append("  ·  ", style="dim")
+        legend.append("crossings", style="bold dim")
+        legend.append(" = 1% util boundaries", style="dim")
+        legend.append("  ·  ", style="dim")
+        legend.append(f"{s.other_window} %", style="bold dim")
+        legend.append(" = informational only", style="dim")
+
+        labels = Text("  ")
+        labels.append(_render_column_labels(s.other_window))
+
+        return Group(
+            Rule(style="bright_black"),
+            labels,
+            status,
+            secondary,
+            legend,
+        )
+
+
 def main() -> None:
     args = parse_args()
     window = args.window
@@ -679,6 +877,19 @@ def main() -> None:
     )
     log(f"command run per iteration: {cmd_preview} <prompt>")
 
+    # // [LAW:single-enforcer] one Console owns all UI rendering during the
+    # iteration loop. file=sys.stderr keeps log output on stderr (matching the
+    # rest of the probe) while the final `print(run_dir)` stays on stdout.
+    ui_console = Console(file=sys.stderr, force_terminal=sys.stderr.isatty())
+    footer = _IterationFooter(_FooterState(
+        window=window,
+        other_window=other_window,
+        crossings=tick_delta(current[util_key], baseline[util_key]),
+        need=need,
+        used_since_tick=used_units_since_tick,
+        est_per_tick=est_units_per_tick,
+    ))
+
     interrupted = False
 
     def handle_interrupt(_signum: int, _frame: object) -> None:
@@ -698,172 +909,191 @@ def main() -> None:
         print(run_dir)
         return
 
-    for iter_num in range(next_iter, 10_000):
-        if interrupted:
-            break
-
-        n = f"{iter_num:03d}"
-        ticks_seen = tick_delta(current[util_key], baseline[util_key])
-        size_name, rem = choose_prompt_size(
-            ticks_seen, need, est_units_per_tick, used_units_since_tick
-        )
-
-        # Timestamp at the START so each call has a unique prefix and pays
-        # full cache_write cost — that's how a `large` prompt actually consumes
-        # large quota per call. Caching the corpus would let large cache_read
-        # at ~10% the cost, defeating its purpose. Micro stays below the cache
-        # threshold so it skips caching naturally and is sized dynamically to
-        # the remaining distance to the next tick boundary.
-        # Target HALF the remaining distance so micro just barely doesn't
-        # cross — binary-search the boundary. Each non-crossing iter halves
-        # the gap; eventually the smallest meaningful prompt (~80 input-equiv
-        # output floor) finally tips us over with minimal overshoot.
-        prompt_corpus = build_prompt(size_name, micro_target_input_equiv=rem * 0.5)
-        prompt = f"Probe timestamp: {utc_now()}\n" + prompt_corpus
-        prompt_path = run_dir / "prompts" / f"{n}.txt"
-        prompt_path.write_text(prompt)
-        output_path = run_dir / "claude-output" / f"{n}.txt"
-
-        cmd_name = "python3" if args.dry_run else "claude"
-        if not args.dry_run:
-            # [LAW:single-enforcer] `--` is the single boundary that stops the
-            # variadic `--tools` option from consuming the positional prompt.
-            cmd = [cmd_name, "-p", "--model", model, "--system-prompt", "", "--no-session-persistence", "--tools", "", "--", prompt]
-        else:
-            cmd = [cmd_name, "-c", "import sys; print(sys.argv[1])", prompt]
-
-        start = time.time_ns()
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=claude_env(data_dir) if not args.dry_run else None,
-        )
-        stdout, _ = proc.communicate()
-        wall_ms = (time.time_ns() - start) // 1_000_000
-        completed = subprocess.CompletedProcess(cmd, proc.returncode, stdout)
-        output_path.write_text(completed.stdout)
-        output_summary = summarize_output(completed.stdout)
-
-        if interrupted:
-            log("interrupt received during iteration; skipping post-call metrics snapshot and exiting")
-            log("running report.py with data captured before interrupt")
-            run_report(script_dir, run_dir)
-            print_comparison(run_dir, data_dir, window)
-            log(f"resume with: {resume_command_for_run(window, run_dir)}")
-            return
-
-        try:
-            snap = snapshot_metrics(run_dir, metrics_url, f"{n}-after", model)
-        except Exception as exc:
-            log(f"metrics endpoint unreachable after iteration {iter_num} ({exc}); proxy likely shut down — running report on data captured so far")
-            run_report(script_dir, run_dir)
-            print_comparison(run_dir, data_dir, window)
-            log(f"resume with: {resume_command_for_run(window, run_dir)}")
-            return
-        usage = {
-            "requests": snap["model_requests"] - current["model_requests"],
-            "input": snap["model_input_tokens"] - current["model_input_tokens"],
-            "output": snap["model_output_tokens"] - current["model_output_tokens"],
-            "cache_create": snap["model_cache_creation_input_tokens"] - current["model_cache_creation_input_tokens"],
-            "cache_read": snap["model_cache_read_input_tokens"] - current["model_cache_read_input_tokens"],
-        }
-        priced_iter_units = quota_input_equivalent_tokens(usage)
-        iter_units = priced_iter_units
-        prev_ticks = tick_delta(current[util_key], baseline[util_key])
-        new_ticks = tick_delta(snap[util_key], baseline[util_key])
-        crossed = max(0, new_ticks - prev_ticks)
-
-        used_units_since_tick += iter_units
-        observed_units += iter_units
-        if crossed > 0:
-            observed_ticks += crossed
-            est_units_per_tick = observed_units / observed_ticks
-            used_units_since_tick = max(0.0, used_units_since_tick - est_units_per_tick * crossed)
-
-        if interrupted:
-            log("running report.py")
-            run_report(script_dir, run_dir)
-            log(f"resume with: {resume_command_for_run(window, run_dir)}")
-            return
-
-        iteration = {
-            "iter": iter_num,
-            "ts": utc_now(),
-            "prompt_file": str(prompt_path),
-            "output_file": str(output_path),
-            "prompt_size": size_name,
-            "prompt_chars": len(prompt_corpus),
-            "prompt_words": len(prompt_corpus.split()),
-            "window": window,
-            "estimated_remaining_input_equiv_tokens_before_call": rem,
-            "exit_code": completed.returncode,
-            "wall_ms": wall_ms,
-            "requests": usage["requests"],
-            "input_tokens": usage["input"],
-            "output_tokens": usage["output"],
-            "cache_creation_input_tokens": usage["cache_create"],
-            "cache_read_input_tokens": usage["cache_read"],
-            "priced_input_equivalent_tokens": priced_iter_units,
-            "input_equivalent_tokens": iter_units,
-        }
-        with (run_dir / "iterations.jsonl").open("a") as f:
-            f.write(json.dumps(iteration) + "\n")
-
-        if completed.returncode != 0 and not args.dry_run:
-            log(f"#{n} claude exited {completed.returncode}: {output_summary}")
-
-        if usage["requests"] == 0 and not args.dry_run:
-            fatal_reason = fatal_output_reason(completed.stdout)
-            # // [LAW:single-enforcer] local CLI failures should be diagnosed at
-            # the probe boundary once, instead of silently leaking as zero-usage iterations.
-            if fatal_reason is not None:
-                die(f"claude failed locally before any proxied request: {fatal_reason}")
-
-        ticks_now = tick_delta(snap[util_key], baseline[util_key])
-        # // [LAW:one-source-of-truth] Anthropic reports util as integer percent;
-        # never display fractional percentages we didn't actually measure.
-        util_pct = int(snap[util_key] * 100 + 1e-9)
-        other_util_pct = int(snap[f"util_{other_window}"] * 100 + 1e-9)
-        next_until_tick = max(0.0, est_units_per_tick - used_units_since_tick)
-
-        crossed_str = green(str(crossed)) if crossed > 0 else dim(str(crossed))
-        total_str = bold(str(ticks_now)) if ticks_now >= need else str(ticks_now)
-
-        log(f"iteration {bold(iter_num)}: prompt size {cyan(size_name)}, took {wall_ms/1000:.1f} seconds")
-        log_raw(
-            f"  {window} window: utilization {yellow(f'{util_pct}%')}, "
-            f"ticks crossed this call: {crossed_str}, "
-            f"ticks crossed total: {total_str} of {need} needed, "
-            f"input-equivalent tokens until next tick: ~{bold(f'{next_until_tick:,.0f}')}"
-        )
-        log_raw(
-            f"  {other_window} window utilization (informational): {yellow(f'{other_util_pct}%')}"
-        )
-        cache_read_str = f"{usage['cache_read']:,}"
-        cache_write_str = f"{usage['cache_create']:,}"
-        log_raw(
-            f"  tokens used this call: "
-            f"input {magenta(usage['input'])}, "
-            f"output {magenta(usage['output'])}, "
-            f"cache read {magenta(cache_read_str)}, "
-            f"cache write {magenta(cache_write_str)} "
-            f"{dim(f'(input-equivalent total: {iter_units:,.0f})')}"
-        )
-
-        current = snap
-        ticks_seen = tick_delta(current[util_key], baseline[util_key])
-
-        if args.dry_run:
-            if iter_num >= dry_iterations:
-                log(f"DRY RUN: completed {iter_num} iteration(s); stopping (observed {ticks_seen})")
+    # // [LAW:single-enforcer] the Live block owns the persistent footer for
+    # the entire iteration loop. Inside this `with`, calls to ui_console.print
+    # emit above the live region; early `return`s exit Live cleanly via __exit__.
+    with Live(footer, console=ui_console, refresh_per_second=10, transient=False) as live:
+        for iter_num in range(next_iter, 10_000):
+            if interrupted:
                 break
-            continue
 
-        if ticks_seen >= need:
-            log(f"target reached ({window}): observed {ticks_seen} crossings (need {need}) → {target_ticks} clean tick(s) across {iter_num} iterations")
-            break
+            n = f"{iter_num:03d}"
+            ticks_seen = tick_delta(current[util_key], baseline[util_key])
+            size_name, rem = choose_prompt_size(
+                ticks_seen, need, est_units_per_tick, used_units_since_tick
+            )
+
+            # In-flight: spinner + size label in the footer while claude runs.
+            footer.update(in_flight_size=size_name)
+            live.refresh()
+
+            # Timestamp at the START so each call has a unique prefix and pays
+            # full cache_write cost — that's how a `large` prompt actually consumes
+            # large quota per call. Caching the corpus would let large cache_read
+            # at ~10% the cost, defeating its purpose. Micro stays below the cache
+            # threshold so it skips caching naturally and is sized dynamically to
+            # the remaining distance to the next tick boundary.
+            # Target HALF the remaining distance so micro just barely doesn't
+            # cross — binary-search the boundary. Each non-crossing iter halves
+            # the gap; eventually the smallest meaningful prompt (~80 input-equiv
+            # output floor) finally tips us over with minimal overshoot.
+            prompt_corpus = build_prompt(size_name, micro_target_input_equiv=rem * 0.5)
+            prompt = f"Probe timestamp: {utc_now()}\n" + prompt_corpus
+            prompt_path = run_dir / "prompts" / f"{n}.txt"
+            prompt_path.write_text(prompt)
+            output_path = run_dir / "claude-output" / f"{n}.txt"
+
+            cmd_name = "python3" if args.dry_run else "claude"
+            if not args.dry_run:
+                # [LAW:single-enforcer] `--` is the single boundary that stops the
+                # variadic `--tools` option from consuming the positional prompt.
+                cmd = [cmd_name, "-p", "--model", model, "--system-prompt", "", "--no-session-persistence", "--tools", "", "--", prompt]
+            else:
+                cmd = [cmd_name, "-c", "import sys; print(sys.argv[1])", prompt]
+
+            start = time.time_ns()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=claude_env(data_dir) if not args.dry_run else None,
+            )
+            stdout, _ = proc.communicate()
+            wall_ms = (time.time_ns() - start) // 1_000_000
+            completed = subprocess.CompletedProcess(cmd, proc.returncode, stdout)
+            output_path.write_text(completed.stdout)
+            output_summary = summarize_output(completed.stdout)
+
+            if interrupted:
+                log("interrupt received during iteration; skipping post-call metrics snapshot and exiting")
+                log("running report.py with data captured before interrupt")
+                run_report(script_dir, run_dir)
+                print_comparison(run_dir, data_dir, window)
+                log(f"resume with: {resume_command_for_run(window, run_dir)}")
+                return
+
+            try:
+                snap = snapshot_metrics(run_dir, metrics_url, f"{n}-after", model)
+            except Exception as exc:
+                log(f"metrics endpoint unreachable after iteration {iter_num} ({exc}); proxy likely shut down — running report on data captured so far")
+                run_report(script_dir, run_dir)
+                print_comparison(run_dir, data_dir, window)
+                log(f"resume with: {resume_command_for_run(window, run_dir)}")
+                return
+            usage = {
+                "requests": snap["model_requests"] - current["model_requests"],
+                "input": snap["model_input_tokens"] - current["model_input_tokens"],
+                "output": snap["model_output_tokens"] - current["model_output_tokens"],
+                "cache_create": snap["model_cache_creation_input_tokens"] - current["model_cache_creation_input_tokens"],
+                "cache_read": snap["model_cache_read_input_tokens"] - current["model_cache_read_input_tokens"],
+            }
+            priced_iter_units = quota_input_equivalent_tokens(usage)
+            iter_units = priced_iter_units
+            prev_ticks = tick_delta(current[util_key], baseline[util_key])
+            new_ticks = tick_delta(snap[util_key], baseline[util_key])
+            crossed = max(0, new_ticks - prev_ticks)
+
+            used_units_since_tick += iter_units
+            observed_units += iter_units
+            if crossed > 0:
+                observed_ticks += crossed
+                est_units_per_tick = observed_units / observed_ticks
+                used_units_since_tick = max(0.0, used_units_since_tick - est_units_per_tick * crossed)
+
+            if interrupted:
+                log("running report.py")
+                run_report(script_dir, run_dir)
+                log(f"resume with: {resume_command_for_run(window, run_dir)}")
+                return
+
+            iteration = {
+                "iter": iter_num,
+                "ts": utc_now(),
+                "prompt_file": str(prompt_path),
+                "output_file": str(output_path),
+                "prompt_size": size_name,
+                "prompt_chars": len(prompt_corpus),
+                "prompt_words": len(prompt_corpus.split()),
+                "window": window,
+                "estimated_remaining_input_equiv_tokens_before_call": rem,
+                "exit_code": completed.returncode,
+                "wall_ms": wall_ms,
+                "requests": usage["requests"],
+                "input_tokens": usage["input"],
+                "output_tokens": usage["output"],
+                "cache_creation_input_tokens": usage["cache_create"],
+                "cache_read_input_tokens": usage["cache_read"],
+                "priced_input_equivalent_tokens": priced_iter_units,
+                "input_equivalent_tokens": iter_units,
+            }
+            with (run_dir / "iterations.jsonl").open("a") as f:
+                f.write(json.dumps(iteration) + "\n")
+
+            if completed.returncode != 0 and not args.dry_run:
+                log(f"#{n} claude exited {completed.returncode}: {output_summary}")
+
+            if usage["requests"] == 0 and not args.dry_run:
+                fatal_reason = fatal_output_reason(completed.stdout)
+                # // [LAW:single-enforcer] local CLI failures should be diagnosed at
+                # the probe boundary once, instead of silently leaking as zero-usage iterations.
+                if fatal_reason is not None:
+                    die(f"claude failed locally before any proxied request: {fatal_reason}")
+
+            ticks_now = tick_delta(snap[util_key], baseline[util_key])
+            # // [LAW:one-source-of-truth] Anthropic reports util as integer percent;
+            # never display fractional percentages we didn't actually measure.
+            util_pct_pre = int(current[util_key] * 100 + 1e-9)
+            util_pct = int(snap[util_key] * 100 + 1e-9)
+            other_util_pct = int(snap[f"util_{other_window}"] * 100 + 1e-9)
+
+            # Commit the iteration row to scrollback (above the live footer).
+            ui_console.print(
+                "  ",
+                _fmt_iter_row(
+                    iter_num=iter_num,
+                    size_name=size_name,
+                    wall_s=wall_ms / 1000.0,
+                    util_pre=util_pct_pre,
+                    util_post=util_pct,
+                    other_util_pct=other_util_pct,
+                    iter_units=iter_units,
+                    est_units_per_tick=est_units_per_tick,
+                    crossings=ticks_now,
+                    need=need,
+                    crossed_this_call=crossed,
+                ),
+                sep="",
+            )
+
+            # Refresh the live footer with the new totals.
+            footer.update(
+                crossings=ticks_now,
+                cum_input_eq=footer.state.cum_input_eq + iter_units,
+                cum_wall_s=footer.state.cum_wall_s + wall_ms / 1000.0,
+                used_since_tick=used_units_since_tick,
+                est_per_tick=est_units_per_tick,
+                in_flight_size=None,
+                target_reached=ticks_now >= need,
+            )
+
+            current = snap
+            ticks_seen = tick_delta(current[util_key], baseline[util_key])
+
+            if args.dry_run:
+                if iter_num >= dry_iterations:
+                    log(f"DRY RUN: completed {iter_num} iteration(s); stopping (observed {ticks_seen})")
+                    break
+                continue
+
+            if ticks_seen >= need:
+                log(f"target reached ({window}): observed {ticks_seen} crossings (need {need}) → {target_ticks} clean tick(s) across {iter_num} iterations")
+                break
+
+    # Live region with transient=False leaves the final footer rendered in
+    # place but does not emit a trailing newline; without this, the next
+    # log() lands on the same visual line as the legend's last char.
+    print(file=sys.stderr)
 
     if interrupted:
         log("running report.py")
