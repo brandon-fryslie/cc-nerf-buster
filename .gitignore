@@ -8,6 +8,7 @@
 
 # Go build output
 /cc-nerf-buster
+/mock-anthropic
 
 # Python cache artifacts
 __pycache__/

@@ -3,13 +3,16 @@ default: check
 build:
     go build -o cc-nerf-buster .
 
+build-mock:
+    go build -o mock-anthropic ./cmd/mock-anthropic
+
 run *ARGS: build
     ./cc-nerf-buster {{ARGS}}
 
 fmt:
     gofmt -w .
 
-check: fmt vet build
+check: fmt vet build build-mock
 
 vet:
     go vet ./...
