@@ -60,14 +60,30 @@ type gaugeSet struct {
 }
 
 // quotaSnapshot records utilization and cumulative cost at a point in time.
+//
+// The `bracketed` flag is the safety against accumulating LEADING-bracket data:
+// when we first observe a window (proxy startup, post-rollover, or a previously
+// idle window), we have NO IDEA where in the sub-percent range the internal
+// util actually sits — the API only reports integer percent. The first observed
+// crossing tells us we just passed an integer boundary, so it ESTABLISHES a
+// known anchor, but the cost spent reaching it isn't 1 tick (it's "somewhere
+// between 0 and 1.x ticks"). Only crossings observed AFTER that first anchor
+// give clean per-tick measurements. `bracketed` is true only after we've seen
+// that first anchor-establishing crossing.
+// // [LAW:single-enforcer] this is the one place leading-bracket exclusion
+// is enforced; report.py's measured_ticks does the same exclusion at the
+// per-run boundary.
 type quotaSnapshot struct {
-	util float64
-	cost float64
-	set  bool // false until first observation
+	util      float64
+	cost      float64
+	set       bool // false until first observation in this run/window
+	bracketed bool // true only after the first observed crossing has anchored snap
 }
 
-// capacityEstimator accumulates cost and utilization deltas across all ticks.
-// capacity = totalCostDelta / totalUtilDelta — improves with every observation.
+// capacityEstimator accumulates cost and utilization deltas across CLEAN
+// measured ticks only — bracketed by two consecutive observed crossings.
+// capacity = totalCostDelta / totalUtilDelta. The first crossing in any
+// window-run is excluded (it's the anchor for measurement, not a measurement).
 type capacityEstimator struct {
 	TotalCostDelta float64 `json:"total_cost_delta"`
 	TotalUtilDelta float64 `json:"total_util_delta"`
@@ -198,43 +214,86 @@ func (m *Metrics) Record(event *APIEvent) {
 	}
 }
 
-// updateCapacityEstimate accumulates cost/utilization deltas for capacity estimation.
+// updateCapacityEstimate accumulates cost/utilization deltas for capacity
+// estimation, but ONLY for clean per-tick measurements bracketed by two
+// observed crossings. The first observed crossing in any window-run is the
+// anchor — it tells us where we are, but the cost spent reaching it spans
+// an unknown sub-percent slice and is NOT 1 tick. Including it (which the
+// previous implementation did) inflated the running estimate by whatever
+// random partial tick happened to precede the first crossing.
+//
 // Called with costMu held. Returns true if the estimator was updated.
 func updateCapacityEstimate(snap *quotaSnapshot, est *capacityEstimator, util float64, currentCost float64) bool {
-	// Utilization reset (window rolled over) — start fresh snapshot
+	// Utilization reset (window rolled over) — discard the bracketed anchor;
+	// the next crossing will re-establish one. // [LAW:dataflow-not-control-flow]
+	// rollover changes the data (snap.set=false, bracketed=false), not the path.
 	if snap.set && util < snap.util {
 		snap.set = false
+		snap.bracketed = false
 	}
 
-	// First observation — record baseline
+	// First observation in this window-run — record initial position. We do
+	// NOT know where in the sub-percent range we actually sit; this is just
+	// a starting reference for spotting the first crossing.
 	if !snap.set {
 		snap.util = util
 		snap.cost = currentCost
 		snap.set = true
+		snap.bracketed = false
 		return false
 	}
 
-	// No change in utilization — nothing to accumulate
 	deltaUtil := util - snap.util
 	deltaCost := currentCost - snap.cost
 
-	if deltaUtil <= 0 || deltaCost <= 0 {
+	// No tick advance — keep waiting. We do NOT update snap.cost here, so the
+	// running cost between observations stays attributed to the next crossing.
+	if deltaUtil <= 0 {
 		return false
 	}
 
-	// Accumulate into running totals
+	// First observed crossing — this ESTABLISHES the bracketed anchor at a
+	// known just-after-cross position. The cost spent reaching it is the
+	// LEADING BRACKET (unknown internal start position) and is excluded from
+	// the running estimate. Update snap to anchor; do not accumulate.
+	if !snap.bracketed {
+		snap.util = util
+		snap.cost = currentCost
+		snap.bracketed = true
+		return false
+	}
+
+	// Subsequent crossing from a bracketed anchor — clean per-tick measurement.
+	// Both endpoints are known just-after-cross positions, so deltaCost / deltaUtil
+	// is a valid estimate of weighted-USD per unit utilization.
+	if deltaCost <= 0 {
+		// Cost not advancing while util did is a proxy/extraction bug, not a
+		// measurement. Re-anchor without accumulating to avoid corrupting est.
+		snap.util = util
+		snap.cost = currentCost
+		return false
+	}
+
 	est.TotalCostDelta += deltaCost
 	est.TotalUtilDelta += deltaUtil
 
-	// Update snapshot for next delta
 	snap.util = util
 	snap.cost = currentCost
 	return true
 }
 
 // persistedEstimates is the on-disk format for quota capacity data.
+//
+// Schema is versioned. v2 introduced leading-bracket exclusion in the
+// capacityEstimator (see updateCapacityEstimate). v1 data is corrupted with
+// leading-bracket pollution — it included the unknown partial tick before
+// the first observed crossing in every window-run. v1 files are discarded
+// on load; the proxy starts fresh and re-accumulates from clean measurements.
+const quotaEstimatesSchemaVersion = 2
+
 type persistedEstimates struct {
-	// Keyed by "org\x00upstream"
+	Version int `json:"schema_version"`
+	// Keyed by "org/upstream"
 	Estimates map[string]*persistedEstimateEntry `json:"estimates"`
 }
 
@@ -248,6 +307,9 @@ func (m *Metrics) estimatesPath() string {
 }
 
 // loadEstimates restores accumulated capacity estimates from disk.
+// Files at older schema versions are discarded (not migrated): pre-v2 data
+// is known-polluted with leading-bracket cost and would corrupt the new
+// estimator if mixed in.
 func (m *Metrics) loadEstimates() {
 	data, err := os.ReadFile(m.estimatesPath())
 	if err != nil {
@@ -260,10 +322,19 @@ func (m *Metrics) loadEstimates() {
 		return
 	}
 
+	if pe.Version != quotaEstimatesSchemaVersion {
+		log.Printf(
+			"discarding %s: schema version %d, expected %d "+
+				"(pre-v2 data is corrupted with leading-bracket cost; "+
+				"estimator will re-accumulate from clean measurements)",
+			m.estimatesPath(), pe.Version, quotaEstimatesSchemaVersion,
+		)
+		return
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for key, entry := range pe.Estimates {
-		// Persisted key uses "/" separator; internal key uses \x00
 		parts := strings.SplitN(key, "/", 2)
 		if len(parts) != 2 {
 			continue
@@ -278,19 +349,26 @@ func (m *Metrics) loadEstimates() {
 		gs.sevenDayEst = entry.SevenDay
 	}
 
-	log.Printf("loaded quota estimates from %s", m.estimatesPath())
+	log.Printf("loaded quota estimates from %s (schema v%d)", m.estimatesPath(), pe.Version)
 }
 
 // persistEstimates writes accumulated capacity estimates to disk.
-// Called with gs.costMu held by the caller.
+// Called with gs.costMu held by the caller. We preserve other org/upstream
+// entries from the existing file ONLY if it's at the current schema version;
+// otherwise the file is replaced (pre-v2 entries are corrupted and dropping
+// them is the correct action).
 func (m *Metrics) persistEstimates(org, upstream string, fiveHour, sevenDay *capacityEstimator) {
-	// Read existing file to preserve other org/upstream entries
-	pe := &persistedEstimates{Estimates: make(map[string]*persistedEstimateEntry)}
+	pe := &persistedEstimates{
+		Version:   quotaEstimatesSchemaVersion,
+		Estimates: make(map[string]*persistedEstimateEntry),
+	}
 
 	if data, err := os.ReadFile(m.estimatesPath()); err == nil {
-		json.Unmarshal(data, pe) // best effort
-		if pe.Estimates == nil {
-			pe.Estimates = make(map[string]*persistedEstimateEntry)
+		var existing persistedEstimates
+		if json.Unmarshal(data, &existing) == nil &&
+			existing.Version == quotaEstimatesSchemaVersion &&
+			existing.Estimates != nil {
+			pe.Estimates = existing.Estimates
 		}
 	}
 

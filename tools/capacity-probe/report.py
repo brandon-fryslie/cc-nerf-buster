@@ -160,9 +160,13 @@ def build_bounds_summary(window: str, ticks: list[dict], proxy_capacity_usd: flo
     midpoint = avg_capacity(ticks, "cap_midpoint_usd")
     high_post = avg_capacity(ticks, "cap_post_usd")
     bounded = low_pre is not None and midpoint is not None and high_post is not None
-    selected = midpoint if midpoint is not None else proxy_capacity_usd
     # // [LAW:one-source-of-truth] bounds.json is the canonical derived summary
     # for quota bounds; report.md and CLI output are rendered from the same data.
+    # // [LAW:single-enforcer] when there are no clean measured ticks, the
+    # answer is "no measurement" — NOT a silent fallback to the proxy's
+    # running estimate. The proxy estimate exists for runtime introspection;
+    # using it as a substitute for measurement was the bug that hid runs that
+    # produced zero clean ticks behind a number that looked authoritative.
     return {
         "window": window,
         "clean_measured_ticks": len(ticks),
@@ -171,7 +175,7 @@ def build_bounds_summary(window: str, ticks: list[dict], proxy_capacity_usd: flo
             "low_pre": low_pre,
             "midpoint": midpoint,
             "high_post": high_post,
-            "selected": selected,
+            "selected": midpoint,  # None when no clean ticks — no fallback
         },
         "tokens": None if not bounded else {
             "low_pre": token_projection(low_pre),
@@ -188,8 +192,14 @@ def render_bounds_summary(bounds: dict, pinned_model_family: str) -> list[str]:
         f"  clean measured ticks: {bounds['clean_measured_ticks']}",
     ]
     if weighted["midpoint"] is None:
-        lines.append("  measured bounds: unavailable (no clean measured ticks)")
-        lines.append(f"  proxy lifetime estimate: {weighted['selected']:.6f} weighted-USD")
+        lines.append("  result: UNAVAILABLE — no clean measured ticks in this run")
+        lines.append("    (a clean measurement requires two observed crossings; the first")
+        lines.append("     establishes the bracket anchor, subsequent crossings each measure")
+        lines.append("     one tick. Run longer to produce a measurement.)")
+        proxy = bounds.get("proxy_lifetime_capacity_usd", 0.0)
+        if proxy > 0:
+            lines.append(f"  proxy lifetime accumulator: {proxy:.6f} weighted-USD "
+                         "(diagnostic; NOT a substitute for a clean measurement)")
         return lines
 
     model_tokens = bounds["tokens"]["midpoint"][pinned_model_family]
@@ -217,8 +227,11 @@ def render_probe_exit_summary(bounds: dict, pinned_model_family: str) -> list[st
         weighted = summary["weighted_usd"]
         lines.append(f"  {window} bounds:")
         if weighted["midpoint"] is None:
-            lines.append("    low=unavailable midpoint=unavailable high=unavailable")
-            lines.append(f"    proxy_lifetime_estimate={weighted['selected']:.6f} weighted-USD")
+            lines.append("    result: UNAVAILABLE (no clean measured ticks in this run)")
+            proxy = summary.get("proxy_lifetime_capacity_usd", 0.0)
+            if proxy > 0:
+                lines.append(f"    proxy_lifetime_accumulator={proxy:.6f} weighted-USD "
+                             "(diagnostic only)")
         else:
             tokens = summary["tokens"]["midpoint"][pinned_model_family]
             lines.append(
@@ -325,10 +338,12 @@ def main(run_dir: Path, print_bounds: bool) -> None:
     push("- **Post-post** — uses the first snapshot after each boundary crossing. Overshoots (bias: high) but partially cancels if call sizes are uniform.")
     push("- **Pre-pre** — uses the last snapshot before each boundary crossing. Undershoots (bias: low).")
     push("")
-    push(f"Proxy lifetime estimate (exposed at `/metrics`, accumulated across all observations since the proxy started — includes data from before this probe run):")
+    push(f"Proxy lifetime accumulator (exposed at `/metrics`, accumulated across all clean per-tick measurements since the proxy started — leading-bracket cost is excluded; see `metrics.go` `updateCapacityEstimate`):")
     push("")
-    push(f"- 5h capacity (proxy): `{proxy_cap_5h:.6f}` (weighted-USD)")
-    push(f"- 7d capacity (proxy): `{proxy_cap_7d:.6f}` (weighted-USD)")
+    push(f"- 5h accumulator (proxy): `{proxy_cap_5h:.6f}` (weighted-USD per tick)")
+    push(f"- 7d accumulator (proxy): `{proxy_cap_7d:.6f}` (weighted-USD per tick)")
+    push("")
+    push("This number is diagnostic only. The authoritative result for this run is the per-tick value computed below from this run's clean measured ticks (if any).")
     push("")
     push("### Probe-derived capacity (this run only)")
     push("")
@@ -352,7 +367,8 @@ def main(run_dir: Path, print_bounds: bool) -> None:
         push(f"#### {window}")
         push("")
         if weighted["midpoint"] is None:
-            push("_(no clean measured ticks in this run — only the proxy lifetime estimate is available)_")
+            push("_(no clean measured ticks in this run — result UNAVAILABLE. "
+                 "A clean measurement requires two observed crossings.)_")
             push("")
             continue
         pinned_mid = summary["tokens"]["midpoint"][pinned_model_family]
@@ -370,7 +386,7 @@ def main(run_dir: Path, print_bounds: bool) -> None:
         push(f"#### {label}")
         push("")
         if mid is None:
-            push("_(no clean measured ticks in this run — no probe-derived number available. The proxy lifetime estimate above is still valid.)_")
+            push("_(no clean measured ticks in this run — result UNAVAILABLE.)_")
             push("")
             continue
         push("| Model   | Input tokens        | Output tokens       |")

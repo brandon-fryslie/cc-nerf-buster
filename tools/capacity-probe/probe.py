@@ -434,6 +434,13 @@ def fmt_delta(curr: float | None, prev: float | None, unit: str = "") -> str:
 
 
 def print_comparison(run_dir: Path, data_dir: Path, window: str) -> None:
+    """Compare this run's measurement against the most recent prior run.
+
+    Refuses to print a delta if either side has zero clean measured ticks —
+    a run with no clean measurements has no measurement to compare against,
+    and a delta against a non-measurement is meaningless. Surfacing the
+    delta anyway was the bug that made invalid runs look authoritative.
+    """
     cur_path = run_dir / "bounds.json"
     if not cur_path.exists():
         return
@@ -456,6 +463,17 @@ def print_comparison(run_dir: Path, data_dir: Path, window: str) -> None:
     prev_opus = ((pw.get("tokens") or {}).get("midpoint") or {}).get("opus", {}).get("input_per_tick")
     log_raw(f"  {bold(window)} window:")
     log_raw(f"    clean measured ticks: {cur_ticks} this run, {prev_ticks} previous run")
+
+    if cur_ticks == 0 and prev_ticks == 0:
+        log_raw(yellow("    no comparison: neither run produced clean measurements"))
+        return
+    if cur_ticks == 0:
+        log_raw(yellow("    no comparison: this run produced no clean measurements"))
+        return
+    if prev_ticks == 0:
+        log_raw(yellow("    no comparison: previous run produced no clean measurements"))
+        return
+
     if cur_usd is not None and prev_usd is not None:
         log_raw(
             f"    weighted-USD per 1% tick: {bold(f'{cur_usd:.2f}')} this run, "
@@ -685,18 +703,37 @@ def _render_preflight(s: _PreFlightSummary) -> Group:
 
 @dataclass
 class _TickBlock:
-    tick_num: int                      # 1-indexed within this run
+    """One stretch of iters between two boundary observations.
+
+    `is_leading_bracket` distinguishes the FIRST block of a run (from
+    baseline up to the first crossing) from clean measurements. The leading
+    block doesn't measure a tick — its starting position inside the integer
+    percent range is unknown, so the cost spent within it spans an unknown
+    sub-percent slice, not 1 tick. It's used as the anchor for measurement
+    #1 but contributes nothing to the headline. // [LAW:single-enforcer]
+    leading-bracket exclusion lives here in the UI and in metrics.go's
+    capacityEstimator; both follow the same definition.
+    """
+    tick_num: int                      # 1-indexed within measured ticks (leading = 0)
     util_pct_at_open: int
     target_util_pct: int
-    units_so_far: float = 0.0          # input-equivalent tokens consumed in this tick
+    is_leading_bracket: bool = False
+    units_so_far: float = 0.0
     wall_s: float = 0.0
     iter_nums: list[int] = field(default_factory=list)
-    last_iter_units_before_cross: float = 0.0  # for the trust bracket
+    last_iter_units_before_cross: float = 0.0
 
 
 def _render_tick_header(tb: _TickBlock, num_total: int) -> Text:
     line = Text("  ")
-    line.append(f"Tick {tb.tick_num}/{num_total}", style="bold cyan")
+    if tb.is_leading_bracket:
+        line.append("Leading bracket", style="bold dim")
+        line.append("   ", style="dim")
+        line.append(f"establishing anchor at {tb.target_util_pct}%  "
+                    f"(not a measurement — see README → Methodology)",
+                    style="dim")
+        return line
+    line.append(f"Measurement {tb.tick_num} of {num_total}", style="bold cyan")
     line.append("   ")
     line.append(f"crossing {tb.util_pct_at_open}% → {tb.target_util_pct}%", style="cyan")
     return line
@@ -746,18 +783,35 @@ def _fmt_iter_row(
 
 
 def _render_tick_close(tb: _TickBlock, crossed: int) -> Group:
-    """The trust signal: per-tick token cost, with the bracket that produced it."""
-    tick_tokens = to_ocw(tb.units_so_far) / max(1, crossed)
+    """Print the close of a tick block.
 
-    # Bracket: the README defines measurement as the last observation BEFORE
-    # the tick crossed and the first AFTER. The spread is the uncertainty.
+    For the leading bracket, this prints an explicit non-measurement notice —
+    the cost between baseline and the first crossing spans an unknown
+    sub-percent slice, NOT 1 tick. Reporting it as "tick 1: X tokens" was
+    the bug that polluted both the post-flight headline and (independently)
+    the proxy's running capacity estimator.
+
+    For a measured tick, this prints the per-tick cost with its bracket: the
+    last observation before the cross and the first after; the spread is the
+    measurement uncertainty.
+    """
     last_iter_ocw = to_ocw(tb.last_iter_units_before_cross)
     cum_after_ocw = to_ocw(tb.units_so_far)
     cum_before_ocw = max(0.0, cum_after_ocw - last_iter_ocw)
 
+    if tb.is_leading_bracket:
+        headline = Text("  ")
+        headline.append("↳ ", style="dim")
+        headline.append("anchor established at ", style="dim")
+        headline.append(f"{tb.target_util_pct}%", style="bold")
+        headline.append(f"   ({int(round(cum_after_ocw)):,} tokens spent reaching it — "
+                        f"NOT counted as a measurement)", style="dim")
+        return Group(headline)
+
+    tick_tokens = to_ocw(tb.units_so_far) / max(1, crossed)
     headline = Text("  ")
     headline.append("→ ", style="bold green")
-    headline.append(f"tick {tb.tick_num}: ", style="bold")
+    headline.append(f"measurement {tb.tick_num}: ", style="bold")
     headline.append(f"{int(round(tick_tokens)):,} tokens", style="bold green")
     if crossed > 1:
         headline.append(f"  (averaged over {crossed} crossings — single iter spanned multiple ticks)",
@@ -850,14 +904,15 @@ class _IterationFooter:
 
 @dataclass
 class _PerTickSummary:
-    tick_num: int
+    tick_num: int                      # measurement number (1-indexed); 0 = leading bracket
     util_pre: int
     util_post: int
-    units: float                       # input-equivalent tokens consumed in this tick
-    last_iter_units_before_cross: float  # input-equivalent
+    units: float                       # input-equivalent tokens consumed in this block
+    last_iter_units_before_cross: float
     wall_s: float
     iter_nums: list[int]
-    crossed: int                       # ticks advanced (>1 = single iter spanned multiple)
+    crossed: int                       # 0 = in flight, ≥1 = crossings observed
+    is_leading_bracket: bool = False   # True for the first block; never a measurement
 
 
 def _render_postflight(
@@ -866,32 +921,48 @@ def _render_postflight(
     total_wall_s: float,
     interrupted: bool,
 ) -> Group:
-    crossed_ticks = [t for t in per_tick if t.crossed > 0]
-    in_flight = [t for t in per_tick if t.crossed == 0]
+    """Result panel.
+
+    The post-flight headline reports per-tick token cost averaged across CLEAN
+    measurements only — leading-bracket blocks (no clean starting position) and
+    in-flight blocks (no closing crossing) are surfaced for transparency but
+    excluded from the average. Same rule report.py applies via measured_ticks.
+    """
+    measured = [t for t in per_tick if t.crossed > 0 and not t.is_leading_bracket]
+    leading = [t for t in per_tick if t.is_leading_bracket]
+    in_flight = [t for t in per_tick if t.crossed == 0 and not t.is_leading_bracket]
 
     title = Rule("Result", style="bold cyan", characters="═")
 
-    if not crossed_ticks:
+    if not measured:
         msg = Text("  ")
-        msg.append("No tick crossings observed", style="bold yellow")
-        msg.append(" — the run ended before any 1% boundary was crossed.")
+        msg.append("Insufficient data — no clean measurements", style="bold yellow")
+        msg.append("\n  ", style="dim")
+        msg.append("A clean measurement requires two observed crossings (the first "
+                   "establishes the anchor, subsequent crossings each measure one tick).",
+                   style="dim")
+        msg.append("\n  ", style="dim")
+        if leading:
+            msg.append(f"This run anchored at {leading[0].util_post}% but no further "
+                       "crossings were observed before it ended.", style="dim")
+        else:
+            msg.append("No crossings were observed before the run ended.", style="dim")
         return Group(title, msg)
 
-    # Per-tick token cost. Each crossing: tokens_in_tick / ticks_crossed (usually 1).
-    per_tick_tokens = [to_ocw(t.units) / t.crossed for t in crossed_ticks]
+    per_tick_tokens = [to_ocw(t.units) / t.crossed for t in measured]
     mid = sum(per_tick_tokens) / len(per_tick_tokens)
     lo = min(per_tick_tokens)
     hi = max(per_tick_tokens)
     spread_pct = (hi - lo) / mid * 100 if mid > 0 else 0.0
 
-    # Headline.
     headline = Text("  ")
     headline.append(f"{int(round(mid)):,}", style="bold green")
     headline.append(" tokens per 1% tick", style="bold")
-    headline.append(f"   ({pre.window} window)", style="dim")
+    headline.append(f"   ({pre.window} window, {len(measured)} clean measurement"
+                    f"{'s' if len(measured) != 1 else ''})", style="dim")
 
     bracket = Text("  ")
-    bracket.append("range across observed crossings: ", style="dim")
+    bracket.append("range across measurements: ", style="dim")
     bracket.append(f"{int(round(lo)):,} — {int(round(hi)):,}")
     bracket.append(f"   (spread {spread_pct:.2f}%)", style="dim")
 
@@ -900,16 +971,15 @@ def _render_postflight(
     quota_line.append("→ implied full-window quota: ", style="dim")
     quota_line.append(f"{int(round(full_quota)):,} tokens", style="bold")
 
-    # Per-tick table — shows the bracket data, the trust signal.
-    table_title = Text("\n  Per-tick measurements (bracket data):", style="bold")
-    cols = [("tick", 5, "l"), ("util", 11, "l"), ("tokens", 12, "r"),
+    table_title = Text("\n  Measurements (bracket data):", style="bold")
+    cols = [("#", 3, "l"), ("util", 11, "l"), ("tokens", 12, "r"),
             ("uncertainty", 18, "r"), ("wall", 9, "r"), ("iters", 7, "r")]
     sep = "   "
     header = Text("    ")
     header.append(sep.join(_pad(lbl, w, a) for lbl, w, a in cols), style="bold dim")
 
     rows: list[Text] = [header]
-    for t in crossed_ticks:
+    for t in measured:
         per_tick_t = to_ocw(t.units) / t.crossed
         last_iter_ocw = to_ocw(t.last_iter_units_before_cross)
         uncertainty_pct = (last_iter_ocw / per_tick_t * 100) if per_tick_t > 0 else 0.0
@@ -918,23 +988,36 @@ def _render_postflight(
         if t.crossed > 1:
             util_s += f" (×{t.crossed})"
         cells = [
-            _pad(str(t.tick_num),                                       cols[0][1], cols[0][2]),
-            _pad(util_s,                                                cols[1][1], cols[1][2]),
-            _pad(f"{int(round(per_tick_t)):,}",                         cols[2][1], cols[2][2]),
+            _pad(str(t.tick_num),                              cols[0][1], cols[0][2]),
+            _pad(util_s,                                       cols[1][1], cols[1][2]),
+            _pad(f"{int(round(per_tick_t)):,}",                cols[2][1], cols[2][2]),
             _pad(f"±{int(round(last_iter_ocw)):,} ({uncertainty_pct:.1f}%)",
-                                                                        cols[3][1], cols[3][2]),
-            _pad(f"{t.wall_s:.1f}s",                                    cols[4][1], cols[4][2]),
-            _pad(str(len(t.iter_nums)),                                 cols[5][1], cols[5][2]),
+                                                               cols[3][1], cols[3][2]),
+            _pad(f"{t.wall_s:.1f}s",                           cols[4][1], cols[4][2]),
+            _pad(str(len(t.iter_nums)),                        cols[5][1], cols[5][2]),
         ]
         row = Text("    ")
         row.append(sep.join(cells))
         rows.append(row)
 
     notes: list[Text] = []
+    if leading:
+        lb = leading[0]
+        ln = Text("\n  ", style="dim")
+        ln.append("excluded (leading bracket): ", style="bold dim")
+        ln.append(f"{int(round(to_ocw(lb.units))):,} tokens spent reaching the first "
+                  f"crossing at {lb.util_post}%, across {len(lb.iter_nums)} iter"
+                  f"{'s' if len(lb.iter_nums) != 1 else ''}. "
+                  "Internal starting position unknown — not a measurement.",
+                  style="dim")
+        notes.append(ln)
     if in_flight:
+        ifb = in_flight[0]
         n = Text("\n  ", style="dim")
-        n.append("note: ", style="bold yellow")
-        n.append(f"{len(in_flight)} tick block(s) in flight (not crossed) — excluded from the headline.")
+        n.append("excluded (in flight): ", style="bold dim")
+        n.append(f"{len(ifb.iter_nums)} iter(s) past the last crossing — "
+                 "no closing crossing observed.",
+                 style="dim")
         notes.append(n)
     if interrupted:
         n = Text("  ", style="dim")
@@ -943,7 +1026,10 @@ def _render_postflight(
         notes.append(n)
 
     summary_meta = Text("\n  ", style="dim")
-    summary_meta.append(f"observed {len(crossed_ticks)} of {pre.required_crossings} target crossings  ·  "
+    summary_meta.append(f"target {pre.required_crossings} crossings  ·  "
+                        f"observed {len(measured) + len(leading)} crossing"
+                        f"{'s' if len(measured) + len(leading) != 1 else ''}  ·  "
+                        f"clean measurements {len(measured)}  ·  "
                         f"total wall {total_wall_s:.1f}s")
 
     return Group(title, headline, bracket, quota_line, summary_meta, table_title, *rows, *notes)
@@ -1081,16 +1167,22 @@ def main() -> None:
     )
     ui_console.print(_render_preflight(pre))
 
-    # Tick-block tracking. Closed tick blocks accumulate for the post-flight
-    # table; the active block is the one currently in flight.
+    # Tick-block tracking. Each entry in closed_ticks is one block of iters
+    # between two boundary observations. The FIRST block is the leading
+    # bracket — its starting position inside the integer percent is unknown,
+    # so it cannot be a measurement; it serves only as the anchor for the
+    # next crossing's measurement. Subsequent blocks are clean per-tick
+    # measurements numbered 1..N.
+    # // [LAW:single-enforcer] the leading-bracket exclusion enforced here
+    # mirrors metrics.go's capacityEstimator and report.py's measured_ticks.
     closed_ticks: list[_PerTickSummary] = []
-    current_tick_num = tick_delta(current[util_key], baseline[util_key]) + 1
+    measurements_done = 0  # count of clean measurements observed so far
 
     footer = _IterationFooter(_FooterState(
         window=window,
         crossings=tick_delta(current[util_key], baseline[util_key]),
         need=need,
-        est_tokens_per_tick=to_ocw(est_units_per_tick),
+        est_tokens_per_tick=0.0,  # no measurement yet; estimate appears once warmed
     ))
 
     interrupted = False
@@ -1121,13 +1213,15 @@ def main() -> None:
     total_msgs = 0
     total_units = 0.0
 
-    # Open the first tick block. On resume, msgs_so_far / units_so_far carry
-    # the in-flight state from iterations.jsonl, so the new session continues
-    # the tick counter rather than restarting it at 0.
+    # The first block is always the leading bracket (starting position
+    # inside the integer percent is unknown — see _TickBlock docstring).
+    # tick_num=0 reserves measurement numbers 1..N for clean ticks.
+    starting_baseline_ticks = tick_delta(current[util_key], baseline[util_key])
     active_tick = _TickBlock(
-        tick_num=current_tick_num,
-        util_pct_at_open=util_pct_baseline + (current_tick_num - 1),
-        target_util_pct=util_pct_baseline + current_tick_num,
+        tick_num=0,
+        util_pct_at_open=util_pct_baseline + starting_baseline_ticks,
+        target_util_pct=util_pct_baseline + starting_baseline_ticks + 1,
+        is_leading_bracket=True,
         units_so_far=used_units_since_tick,
     )
 
@@ -1136,7 +1230,9 @@ def main() -> None:
     # emit above the live region; early `return`s exit Live cleanly via __exit__.
     with Live(footer, console=ui_console, refresh_per_second=10, transient=False) as live:
         ui_console.print(Text(""))
-        ui_console.print(_render_tick_header(active_tick, need))
+        # The number of clean measurements is need-1 (first crossing is the anchor).
+        target_measurements = max(0, need - 1)
+        ui_console.print(_render_tick_header(active_tick, target_measurements))
         ui_console.print(_render_iter_columns_header())
 
         for iter_num in range(next_iter, 10_000):
@@ -1294,7 +1390,8 @@ def main() -> None:
             )
 
             if crossed > 0:
-                # Snapshot the closing tick (full pre-rollover units) for post-flight.
+                # Close the active block. The leading bracket (first block) is
+                # only the anchor; subsequent blocks are clean per-tick measurements.
                 closed_ticks.append(_PerTickSummary(
                     tick_num=active_tick.tick_num,
                     util_pre=active_tick.util_pct_at_open,
@@ -1304,42 +1401,54 @@ def main() -> None:
                     wall_s=active_tick.wall_s,
                     iter_nums=list(active_tick.iter_nums),
                     crossed=crossed,
+                    is_leading_bracket=active_tick.is_leading_bracket,
                 ))
                 ui_console.print(_render_tick_close(active_tick, crossed))
 
-                # Refine estimate from observed ticks; carry overhang forward.
-                observed_ticks += crossed
-                est_units_per_tick = observed_units / observed_ticks
+                # Refine est_units_per_tick from CLEAN measurements only — the
+                # leading bracket's cost includes an unknown sub-percent slice
+                # and must not contribute to the running estimate.
+                # // [LAW:single-enforcer] same exclusion rule as metrics.go.
+                if not active_tick.is_leading_bracket:
+                    measurements_done += crossed
+                    measured_blocks = [t for t in closed_ticks
+                                       if not t.is_leading_bracket and t.crossed > 0]
+                    if measured_blocks:
+                        observed_units_clean = sum(t.units for t in measured_blocks)
+                        observed_ticks_clean = sum(t.crossed for t in measured_blocks)
+                        est_units_per_tick = observed_units_clean / observed_ticks_clean
                 used_units_since_tick = max(0.0, used_units_since_tick - est_units_per_tick * crossed)
                 msgs_since_tick = 0
 
                 if ticks_now < need:
-                    current_tick_num += crossed
+                    next_tick_num = measurements_done + 1
                     active_tick = _TickBlock(
-                        tick_num=current_tick_num,
+                        tick_num=next_tick_num,
                         util_pct_at_open=util_pct,
                         target_util_pct=util_pct + 1,
+                        is_leading_bracket=False,
                         units_so_far=used_units_since_tick,
                     )
                     ui_console.print(Text(""))
-                    ui_console.print(_render_tick_header(active_tick, need))
+                    ui_console.print(_render_tick_header(active_tick, target_measurements))
                     ui_console.print(_render_iter_columns_header())
 
-            # Update running estimate from crossed ticks for the live footer.
-            crossed_per_tick_tokens = [to_ocw(t.units) / t.crossed for t in closed_ticks if t.crossed > 0]
-            if crossed_per_tick_tokens:
-                est_mid = sum(crossed_per_tick_tokens) / len(crossed_per_tick_tokens)
-                spread = (max(crossed_per_tick_tokens) - min(crossed_per_tick_tokens)) / est_mid * 100 \
+            # Running estimate for the live footer: clean measurements only.
+            measured_per_tick_tokens = [to_ocw(t.units) / t.crossed for t in closed_ticks
+                                        if not t.is_leading_bracket and t.crossed > 0]
+            if measured_per_tick_tokens:
+                est_mid = sum(measured_per_tick_tokens) / len(measured_per_tick_tokens)
+                spread = (max(measured_per_tick_tokens) - min(measured_per_tick_tokens)) / est_mid * 100 \
                     if est_mid > 0 else 0.0
             else:
-                est_mid = to_ocw(est_units_per_tick)
+                est_mid = 0.0
                 spread = 0.0
 
             footer.update(
                 crossings=ticks_now,
                 cum_wall_s=footer.state.cum_wall_s + wall_ms / 1000.0,
                 est_tokens_per_tick=est_mid,
-                samples=len(crossed_per_tick_tokens),
+                samples=len(measured_per_tick_tokens),
                 spread_pct=spread,
                 in_flight=False,
                 target_reached=ticks_now >= need,
@@ -1363,23 +1472,26 @@ def main() -> None:
     # log() lands on the same visual line as the footer's last char.
     print(file=sys.stderr)
 
-    # If the active tick block didn't close (interrupt or DRY RUN ended mid-
-    # tick), still surface its iters in post-flight — they happened, they
-    # belong in the record. This is the "every iter visible" rule applied
-    # to summary view too.
-    if active_tick.iter_nums and (
-        not closed_ticks or closed_ticks[-1].tick_num != active_tick.tick_num
-    ):
-        closed_ticks.append(_PerTickSummary(
-            tick_num=active_tick.tick_num,
-            util_pre=active_tick.util_pct_at_open,
-            util_post=active_tick.util_pct_at_open,
-            units=active_tick.units_so_far,
-            last_iter_units_before_cross=active_tick.last_iter_units_before_cross,
-            wall_s=active_tick.wall_s,
-            iter_nums=list(active_tick.iter_nums),
-            crossed=0,
-        ))
+    # If the active block didn't close (interrupt or DRY RUN ended mid-tick),
+    # surface its iters in post-flight as in-flight (crossed=0). It's never
+    # promoted to a measurement; the post-flight handler shows it as excluded.
+    if active_tick.iter_nums:
+        already_recorded = closed_ticks and (
+            closed_ticks[-1].is_leading_bracket == active_tick.is_leading_bracket
+            and closed_ticks[-1].tick_num == active_tick.tick_num
+        )
+        if not already_recorded:
+            closed_ticks.append(_PerTickSummary(
+                tick_num=active_tick.tick_num,
+                util_pre=active_tick.util_pct_at_open,
+                util_post=active_tick.util_pct_at_open,
+                units=active_tick.units_so_far,
+                last_iter_units_before_cross=active_tick.last_iter_units_before_cross,
+                wall_s=active_tick.wall_s,
+                iter_nums=list(active_tick.iter_nums),
+                crossed=0,
+                is_leading_bracket=active_tick.is_leading_bracket,
+            ))
 
     # ─── Post-flight ──────────────────────────────────────────────────────
     ui_console.print(_render_postflight(
