@@ -144,23 +144,12 @@ def _c(s: object, code: str) -> str:
     return f"\033[{code}m{s}\033[0m"
 
 
-def bold(s: object) -> str: return _c(s, "1")
 def dim(s: object) -> str: return _c(s, "2")
-def red(s: object) -> str: return _c(s, "31")
-def green(s: object) -> str: return _c(s, "32")
-def yellow(s: object) -> str: return _c(s, "33")
-def blue(s: object) -> str: return _c(s, "34")
-def magenta(s: object) -> str: return _c(s, "35")
-def cyan(s: object) -> str: return _c(s, "36")
 
 
 def log(msg: str) -> None:
     ts = datetime.now(UTC).strftime("%H:%M:%S")
     print(f"{dim(f'[{ts}]')} {msg}", file=sys.stderr)
-
-
-def log_raw(msg: str) -> None:
-    print(msg, file=sys.stderr)
 
 
 def die(msg: str) -> "NoReturn":
@@ -382,8 +371,12 @@ def resume_command_for_run(window: str, run_dir: Path | None) -> str:
 
 
 def run_report(script_dir: Path, run_dir: Path) -> None:
+    # // [LAW:single-enforcer] the in-terminal "Result" panel + comparison block
+    # is the single human-facing summary surface. report.py runs silently here —
+    # it still writes report.md / bounds.json / crossings.jsonl for audit, and
+    # users who want the bounds view post-hoc invoke `just probe-bounds`.
     subprocess.run(
-        [sys.executable, str(script_dir / "report.py"), "--print-bounds", str(run_dir)],
+        [sys.executable, str(script_dir / "report.py"), str(run_dir)],
         check=True,
     )
 
@@ -418,72 +411,49 @@ def find_previous_run(data_dir: Path, current_run_dir: Path, window: str) -> Pat
     return max(candidates, key=lambda p: p.name)
 
 
-def fmt_delta(curr: float | None, prev: float | None, unit: str = "") -> str:
-    if curr is None or prev is None or prev == 0:
-        return dim("(no comparison)")
-    delta = curr - prev
-    pct = (delta / prev) * 100
-    arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "·")
-    sign = "+" if delta >= 0 else ""
-    body = f"{arrow} {sign}{delta:,.0f}{unit} ({sign}{pct:.1f}%)"
-    if abs(pct) < 1.0:
-        return green(body)
-    if abs(pct) < 5.0:
-        return yellow(body)
-    return red(body)
+@dataclass
+class _PreviousRunComparison:
+    """Resolved measurement of the most recent comparable run, in OCW/tick.
 
-
-def print_comparison(run_dir: Path, data_dir: Path, window: str) -> None:
-    """Compare this run's measurement against the most recent prior run.
-
-    Refuses to print a delta if either side has zero clean measured ticks —
-    a run with no clean measurements has no measurement to compare against,
-    and a delta against a non-measurement is meaningless. Surfacing the
-    delta anyway was the bug that made invalid runs look authoritative.
+    bounds.json stores per-model token projections (e.g. opus input tokens
+    per tick). The Result panel speaks OCW (Opus Cache Write equivalent)
+    units. Convert at the boundary so the panel can render the comparison
+    in the same unit as its headline — mixing units would be a unit-error
+    waiting to happen.
     """
-    cur_path = run_dir / "bounds.json"
-    if not cur_path.exists():
-        return
-    prev_run = find_previous_run(data_dir, run_dir, window)
-    log_raw("")
-    log_raw(bold(f"=== Comparison to previous {window} run ==="))
+    run_name: str
+    clean_ticks: int
+    ocw_per_tick: float
+
+
+def compute_previous_comparison(
+    data_dir: Path,
+    current_run_dir: Path,
+    window: str,
+) -> _PreviousRunComparison | None:
+    prev_run = find_previous_run(data_dir, current_run_dir, window)
     if prev_run is None:
-        log_raw(dim(f"  (no previous non-dry-run with bounds.json found for window {window})"))
-        return
-    cur = json.loads(cur_path.read_text())
-    prev = json.loads((prev_run / "bounds.json").read_text())
-    log_raw(f"  previous run directory: {dim(prev_run.name)}")
-    cw = cur["windows"].get(window, {})
-    pw = prev["windows"].get(window, {})
-    cur_ticks = cw.get("clean_measured_ticks", 0)
-    prev_ticks = pw.get("clean_measured_ticks", 0)
-    cur_usd = (cw.get("weighted_usd") or {}).get("midpoint")
-    prev_usd = (pw.get("weighted_usd") or {}).get("midpoint")
-    cur_opus = ((cw.get("tokens") or {}).get("midpoint") or {}).get("opus", {}).get("input_per_tick")
-    prev_opus = ((pw.get("tokens") or {}).get("midpoint") or {}).get("opus", {}).get("input_per_tick")
-    log_raw(f"  {bold(window)} window:")
-    log_raw(f"    clean measured ticks: {cur_ticks} this run, {prev_ticks} previous run")
-
-    if cur_ticks == 0 and prev_ticks == 0:
-        log_raw(yellow("    no comparison: neither run produced clean measurements"))
-        return
-    if cur_ticks == 0:
-        log_raw(yellow("    no comparison: this run produced no clean measurements"))
-        return
-    if prev_ticks == 0:
-        log_raw(yellow("    no comparison: previous run produced no clean measurements"))
-        return
-
-    if cur_usd is not None and prev_usd is not None:
-        log_raw(
-            f"    weighted-USD per 1% tick: {bold(f'{cur_usd:.2f}')} this run, "
-            f"{prev_usd:.2f} previous run    change: {fmt_delta(cur_usd, prev_usd, ' USD')}"
-        )
-    if cur_opus is not None and prev_opus is not None:
-        log_raw(
-            f"    Opus input tokens per 1% tick: {bold(f'{cur_opus:,}')} this run, "
-            f"{prev_opus:,} previous run    change: {fmt_delta(cur_opus, prev_opus, ' tokens')}"
-        )
+        return None
+    bounds_path = prev_run / "bounds.json"
+    if not bounds_path.exists():
+        return None
+    try:
+        prev = json.loads(bounds_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    pw = prev.get("windows", {}).get(window) or {}
+    clean_ticks = pw.get("clean_measured_ticks", 0)
+    if clean_ticks == 0:
+        return None
+    opus = ((pw.get("tokens") or {}).get("midpoint") or {}).get("opus") or {}
+    input_per_tick = opus.get("input_per_tick")
+    if input_per_tick is None:
+        return None
+    return _PreviousRunComparison(
+        run_name=prev_run.name,
+        clean_ticks=clean_ticks,
+        ocw_per_tick=input_per_tick / CACHE_CREATE_TO_INPUT_EQUIV,
+    )
 
 
 def copy_with_hashes(run_dir: Path, script_dir: Path) -> None:
@@ -920,6 +890,7 @@ def _render_postflight(
     per_tick: list[_PerTickSummary],
     total_wall_s: float,
     interrupted: bool,
+    previous: _PreviousRunComparison | None = None,
 ) -> Group:
     """Result panel.
 
@@ -927,6 +898,9 @@ def _render_postflight(
     measurements only — leading-bracket blocks (no clean starting position) and
     in-flight blocks (no closing crossing) are surfaced for transparency but
     excluded from the average. Same rule report.py applies via measured_ticks.
+
+    `previous` is rendered as a comparison line beneath the headline when both
+    sides have a clean measurement; with no previous run the line is omitted.
     """
     measured = [t for t in per_tick if t.crossed > 0 and not t.is_leading_bracket]
     leading = [t for t in per_tick if t.is_leading_bracket]
@@ -960,6 +934,28 @@ def _render_postflight(
     headline.append(" tokens per 1% tick", style="bold")
     headline.append(f"   ({pre.window} window, {len(measured)} clean measurement"
                     f"{'s' if len(measured) != 1 else ''})", style="dim")
+
+    compare_line: Text | None = None
+    if previous is not None and previous.ocw_per_tick > 0:
+        delta = mid - previous.ocw_per_tick
+        pct = (delta / previous.ocw_per_tick) * 100
+        abs_pct = abs(pct)
+        if abs_pct < 1.0:
+            delta_style = "green"
+        elif abs_pct < 5.0:
+            delta_style = "yellow"
+        else:
+            delta_style = "red"
+        arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "·")
+        compare_line = Text("  ")
+        compare_line.append(f"{arrow} {abs_pct:.1f}%", style=f"bold {delta_style}")
+        compare_line.append(" vs previous run", style="dim")
+        compare_line.append(
+            f"   (was {int(round(previous.ocw_per_tick)):,} — "
+            f"{previous.run_name}, {previous.clean_ticks} measurement"
+            f"{'s' if previous.clean_ticks != 1 else ''})",
+            style="dim",
+        )
 
     bracket = Text("  ")
     bracket.append("range across measurements: ", style="dim")
@@ -1032,7 +1028,11 @@ def _render_postflight(
                         f"clean measurements {len(measured)}  ·  "
                         f"total wall {total_wall_s:.1f}s")
 
-    return Group(title, headline, bracket, quota_line, summary_meta, table_title, *rows, *notes)
+    parts: list[object] = [title, headline]
+    if compare_line is not None:
+        parts.append(compare_line)
+    parts.extend([bracket, quota_line, summary_meta, table_title, *rows, *notes])
+    return Group(*parts)
 
 
 def main() -> None:
@@ -1144,9 +1144,6 @@ def main() -> None:
     )
     log(f"command run per iteration: {cmd_preview} <prompt>")
 
-    # // [LAW:single-enforcer] one Console owns all UI rendering during the
-    # iteration loop. file=sys.stderr keeps log output on stderr (matching the
-    # rest of the probe) while the final `print(run_dir)` stays on stdout.
     ui_console = Console(file=sys.stderr, force_terminal=sys.stderr.isatty())
 
     # ─── Pre-flight ───────────────────────────────────────────────────────
@@ -1204,10 +1201,8 @@ def main() -> None:
             "(resumed into already-complete state).",
             style="dim",
         ))
-        log("running report.py")
         run_report(script_dir, run_dir)
         log(f"run complete: {run_dir}")
-        print(run_dir)
         return
 
     total_msgs = 0
@@ -1289,20 +1284,16 @@ def main() -> None:
 
             if interrupted:
                 log("interrupt received during iteration; skipping post-call metrics snapshot and exiting")
-                log("running report.py with data captured before interrupt")
-                run_report(script_dir, run_dir)
-                print_comparison(run_dir, data_dir, window)
-                log(f"resume with: {resume_command_for_run(window, run_dir)}")
-                return
+                # Fall through to postflight + run_report so the integrated
+                # Result panel (with comparison) renders for this path too.
+                break
 
             try:
                 snap = snapshot_metrics(run_dir, metrics_url, f"{n}-after", model)
             except Exception as exc:
                 log(f"metrics endpoint unreachable after iteration {iter_num} ({exc}); proxy likely shut down — running report on data captured so far")
-                run_report(script_dir, run_dir)
-                print_comparison(run_dir, data_dir, window)
-                log(f"resume with: {resume_command_for_run(window, run_dir)}")
-                return
+                interrupted = True
+                break
             usage = {
                 "requests": snap["model_requests"] - current["model_requests"],
                 "input": snap["model_input_tokens"] - current["model_input_tokens"],
@@ -1332,7 +1323,6 @@ def main() -> None:
             active_tick.last_iter_units_before_cross = iter_units
 
             if interrupted:
-                log("running report.py")
                 run_report(script_dir, run_dir)
                 log(f"resume with: {resume_command_for_run(window, run_dir)}")
                 return
@@ -1494,25 +1484,22 @@ def main() -> None:
             ))
 
     # ─── Post-flight ──────────────────────────────────────────────────────
+    previous = compute_previous_comparison(data_dir, run_dir, window)
     ui_console.print(_render_postflight(
         pre=pre,
         per_tick=closed_ticks,
         total_wall_s=footer.state.cum_wall_s,
         interrupted=interrupted,
+        previous=previous,
     ))
 
+    run_report(script_dir, run_dir)
+
     if interrupted:
-        log("running report.py")
-        run_report(script_dir, run_dir)
         log(f"resume with: {resume_command_for_run(window, run_dir)}")
         return
 
-    log("running report.py")
-    run_report(script_dir, run_dir)
-    print_comparison(run_dir, data_dir, window)
-
     log(f"run complete: {run_dir}")
-    print(run_dir)
 
 
 if __name__ == "__main__":
