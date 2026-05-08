@@ -10,7 +10,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.request import urlopen
@@ -517,7 +517,7 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def load_resume_state(run_dir: Path, window: str) -> tuple[dict, dict, int, float]:
+def load_resume_state(run_dir: Path, window: str) -> tuple[dict, dict, int, float, int]:
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
         die(f"resume run missing manifest: {manifest_path}")
@@ -534,6 +534,7 @@ def load_resume_state(run_dir: Path, window: str) -> tuple[dict, dict, int, floa
 
     current = baseline
     used_units_since_tick = 0.0
+    msgs_since_tick = 0
 
     for row in iterations:
         label = f"{int(row['iter']):03d}-after"
@@ -547,8 +548,10 @@ def load_resume_state(run_dir: Path, window: str) -> tuple[dict, dict, int, floa
         crossed = max(0, new_ticks - prev_ticks)
 
         used_units_since_tick += iter_units
+        msgs_since_tick += 1
         if crossed > 0 and est_units_per_tick > 0:
             used_units_since_tick = max(0.0, used_units_since_tick - est_units_per_tick * crossed)
+            msgs_since_tick = 0
 
         current = snap
 
@@ -556,7 +559,7 @@ def load_resume_state(run_dir: Path, window: str) -> tuple[dict, dict, int, floa
     if iterations:
         next_iter = int(iterations[-1]["iter"]) + 1
 
-    return current, baseline, next_iter, used_units_since_tick
+    return current, baseline, next_iter, used_units_since_tick, msgs_since_tick
 
 
 def resolve_continue_run(data_dir: Path, window: str, dry_run: bool) -> Path:
@@ -588,9 +591,17 @@ def resolve_continue_run(data_dir: Path, window: str, dry_run: bool) -> Path:
 
 
 # --------------------------------------------------------------------------
-# Live iteration UI: per-row data committed to scrollback above a persistent
-# footer (column legend + dynamic status). Implemented with rich.live.Live;
-# inside the Live context, console.print() emits above the live region.
+# Iteration UI. The probe answers four questions, in priority order:
+#   1. What is the per-tick token cost? (the result)
+#   2. Why should I trust it? (each tick crossing shows its bracket)
+#   3. How long until I know? (progress + ETA)
+#   4. What did the run produce? (final results)
+# Everything in this section serves one of those four. If a field doesn't
+# answer one, it doesn't belong.
+#
+# Tokens displayed are Opus cache-write equivalent (the canonical unit used
+# in the project README). We say "tokens" in the UI for brevity and define
+# the unit once in the pre-flight block.
 # --------------------------------------------------------------------------
 
 SIZE_COLOR = {"large": "magenta", "medium": "blue", "small": "cyan", "micro": "yellow"}
@@ -603,17 +614,14 @@ class _Col:
     align: str  # 'l' / 'r' / 'c'
 
 
-# Column widths must accommodate the wider of (label text, max data width).
+# Per-iter row: iter | size | wall | tokens | util% | marker
 _COLS: list[_Col] = [
-    _Col("iter",              4, "r"),
-    _Col("size",              6, "l"),
-    _Col("wall",              5, "r"),
-    _Col("size bar",          8, "l"),
-    _Col("crossings",         9, "r"),
-    _Col("Δ",                 2, "c"),
-    _Col("util %",            7, "l"),
-    _Col("OTHER %",           4, "r"),  # label substituted with the inactive window
-    _Col("Opus Cache Write", 16, "r"),
+    _Col("iter",    5, "r"),
+    _Col("size",    6, "l"),
+    _Col("wall",    6, "r"),
+    _Col("tokens", 10, "r"),
+    _Col("util",    8, "c"),
+    _Col("",       18, "l"),
 ]
 _SEP = "  "
 
@@ -626,85 +634,168 @@ def _pad(text: str, width: int, align: str) -> str:
     return text.center(width)
 
 
-def _render_column_labels(other_window: str) -> Text:
-    cols = list(_COLS)
-    cols[7] = _Col(f"{other_window} %", _COLS[7].width, _COLS[7].align)
-    parts = [_pad(c.label, c.width, c.align) for c in cols]
-    return Text(_SEP.join(parts), style="bold dim")
+# --------------------------------------------------------------------------
+# Pre-flight: tells the user what's about to happen, in plain terms.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _PreFlightSummary:
+    model: str
+    window: str                     # "5h" or "7d"
+    util_pct_baseline: int
+    target_ticks: int               # ticks we want to measure
+    required_crossings: int         # crossings we need to observe (target+1 if not at boundary)
+    est_tokens_per_tick: float      # OCW; the prior estimate we'll refine
+    expected_wall_s: float          # rough ETA
+
+
+def _render_preflight(s: _PreFlightSummary) -> Group:
+    title = Rule("Probe starting", style="bold cyan", characters="═")
+    window_label = "5-hour" if s.window == "5h" else "7-day"
+    eta_min = s.expected_wall_s / 60.0
+
+    rows: list[tuple[str, str]] = [
+        ("Goal",     f"measure tokens per 1% tick on the {window_label} quota window"),
+        ("Method",   f"observe {s.required_crossings} tick crossing{'s' if s.required_crossings != 1 else ''}; "
+                     f"each crossing brackets one tick's token cost"),
+        ("Starting", f"{s.util_pct_baseline}% utilization on {s.window}"),
+        ("Estimate", f"~{int(round(s.est_tokens_per_tick)):,} tokens per tick (prior; will be refined)"),
+        ("ETA",      f"~{eta_min:.1f} min"),
+        ("Tokens",   "Opus cache-write equivalent (see README → Methodology)"),
+    ]
+
+    label_w = max(len(label) for label, _ in rows)
+    lines: list[Text] = []
+    for label, value in rows:
+        line = Text("  ")
+        line.append(_pad(label, label_w, "l"), style="bold")
+        line.append("   ")
+        line.append(value)
+        lines.append(line)
+
+    return Group(title, *lines)
+
+
+# --------------------------------------------------------------------------
+# Run: tick-bracketed iter stream. Each tick opens with a header, every iter
+# is a row inside it, and the tick closes with a summary line.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _TickBlock:
+    tick_num: int                      # 1-indexed within this run
+    util_pct_at_open: int
+    target_util_pct: int
+    units_so_far: float = 0.0          # input-equivalent tokens consumed in this tick
+    wall_s: float = 0.0
+    iter_nums: list[int] = field(default_factory=list)
+    last_iter_units_before_cross: float = 0.0  # for the trust bracket
+
+
+def _render_tick_header(tb: _TickBlock, num_total: int) -> Text:
+    line = Text("  ")
+    line.append(f"Tick {tb.tick_num}/{num_total}", style="bold cyan")
+    line.append("   ")
+    line.append(f"crossing {tb.util_pct_at_open}% → {tb.target_util_pct}%", style="cyan")
+    return line
+
+
+def _render_iter_columns_header() -> Text:
+    parts = [_pad(c.label, c.width, c.align) for c in _COLS]
+    return Text("  " + _SEP.join(parts), style="bold dim")
 
 
 def _fmt_iter_row(
     iter_num: int,
     size_name: str,
     wall_s: float,
+    iter_tokens: float,                 # OCW
     util_pre: int,
     util_post: int,
-    other_util_pct: int,
-    iter_units: float,
-    est_units_per_tick: float,
-    crossings: int,
-    need: int,
     crossed_this_call: int,
 ) -> Text:
-    bar_w = _COLS[3].width
-    bar_frac = (iter_units / est_units_per_tick) if est_units_per_tick > 0 else 0.0
-    bar_frac = max(0.0, min(1.0, bar_frac))
-    filled = int(round(bar_frac * bar_w))
-    if iter_units > 0 and filled == 0:
-        filled = 1  # always show ≥1 cell for nonzero cost
-
-    iter_ocw = to_ocw(iter_units)
     size_c = SIZE_COLOR.get(size_name, "white")
     util_str = f"{util_pre}→{util_post}%"
-    delta_str = "+1" if crossed_this_call > 0 else " ·"
 
-    cells: list[tuple[str, str]] = [
-        (_pad(f"{iter_num}", _COLS[0].width, _COLS[0].align), "bright_black"),
-        (_pad(size_name, _COLS[1].width, _COLS[1].align), size_c),
-        (_pad(f"{wall_s:.1f}s", _COLS[2].width, _COLS[2].align), "bright_black"),
-        ("__BAR__", size_c),
-        (_pad(f"{crossings}/{need}", _COLS[4].width, _COLS[4].align), "bold"),
-        (
-            _pad(delta_str, _COLS[5].width, _COLS[5].align),
-            "bold green" if crossed_this_call > 0 else "bright_black",
-        ),
-        (_pad(util_str, _COLS[6].width, _COLS[6].align), "yellow"),
-        (_pad(f"{other_util_pct}%", _COLS[7].width, _COLS[7].align), "bright_black"),
-        (_pad(f"{int(round(iter_ocw)):,}", _COLS[8].width, _COLS[8].align), "magenta"),
+    marker = Text()
+    if crossed_this_call > 0:
+        marker.append("← tick crossed", style="bold green")
+        if crossed_this_call > 1:
+            marker.append(f" (×{crossed_this_call})", style="bold yellow")
+
+    cells: list[tuple[str | Text, str]] = [
+        (_pad(f"{iter_num}",                 _COLS[0].width, _COLS[0].align), "bright_black"),
+        (_pad(size_name,                     _COLS[1].width, _COLS[1].align), size_c),
+        (_pad(f"{wall_s:.1f}s",              _COLS[2].width, _COLS[2].align), "bright_black"),
+        (_pad(f"{int(round(iter_tokens)):,}", _COLS[3].width, _COLS[3].align), "magenta"),
+        (_pad(util_str,                      _COLS[4].width, _COLS[4].align), "yellow"),
+        (marker, ""),
     ]
 
-    line = Text()
+    line = Text("  ")
     for i, (cell, style) in enumerate(cells):
         if i > 0:
             line.append(_SEP)
-        if cell == "__BAR__":
-            line.append("█" * filled, style=style)
-            line.append("·" * (bar_w - filled), style="bright_black")
+        if isinstance(cell, Text):
+            line.append(cell)
         else:
             line.append(cell, style=style)
     return line
 
 
+def _render_tick_close(tb: _TickBlock, crossed: int) -> Group:
+    """The trust signal: per-tick token cost, with the bracket that produced it."""
+    tick_tokens = to_ocw(tb.units_so_far) / max(1, crossed)
+
+    # Bracket: the README defines measurement as the last observation BEFORE
+    # the tick crossed and the first AFTER. The spread is the uncertainty.
+    last_iter_ocw = to_ocw(tb.last_iter_units_before_cross)
+    cum_after_ocw = to_ocw(tb.units_so_far)
+    cum_before_ocw = max(0.0, cum_after_ocw - last_iter_ocw)
+
+    headline = Text("  ")
+    headline.append("→ ", style="bold green")
+    headline.append(f"tick {tb.tick_num}: ", style="bold")
+    headline.append(f"{int(round(tick_tokens)):,} tokens", style="bold green")
+    if crossed > 1:
+        headline.append(f"  (averaged over {crossed} crossings — single iter spanned multiple ticks)",
+                        style="bold yellow")
+    headline.append(f"   in {tb.wall_s:.1f}s")
+
+    detail = Text("    ", style="dim")
+    detail.append(f"bracket: {int(round(cum_before_ocw)):,} before last call → "
+                  f"{int(round(cum_after_ocw)):,} after  "
+                  f"(uncertainty ≈ {int(round(last_iter_ocw)):,} tokens)")
+
+    return Group(headline, detail)
+
+
+# --------------------------------------------------------------------------
+# Live HUD: progress + running estimate + ETA. Three short lines.
+# --------------------------------------------------------------------------
+
+
 @dataclass
 class _FooterState:
     window: str
-    other_window: str
     crossings: int = 0
     need: int = 0
-    cum_input_eq: float = 0.0
     cum_wall_s: float = 0.0
-    used_since_tick: float = 0.0
-    est_per_tick: float = 0.0
-    in_flight_size: str | None = None
+    in_flight: bool = False
+    in_flight_size: str = ""
     target_reached: bool = False
+    # Running estimate, refined as ticks cross:
+    est_tokens_per_tick: float = 0.0   # OCW
+    samples: int = 0                   # number of crossed ticks contributing
+    spread_pct: float = 0.0            # |max - min| / mid across samples
 
 
 class _IterationFooter:
-    """Persistent live footer: column legend + dynamic status + legend."""
-
     def __init__(self, state: _FooterState) -> None:
         self.state = state
-        self._spinner = Spinner("dots", style="yellow")
+        self._spinner = Spinner("dots", style="cyan")
 
     def update(self, **kwargs: object) -> None:
         for k, v in kwargs.items():
@@ -712,62 +803,150 @@ class _IterationFooter:
 
     def __rich__(self) -> Group:
         s = self.state
-        until_eq = max(0.0, s.est_per_tick - s.used_since_tick)
-        until_ocw = to_ocw(until_eq)
-        consumed_frac = (s.used_since_tick / s.est_per_tick) if s.est_per_tick > 0 else 0
-        consumed_frac = max(0.0, min(1.0, consumed_frac))
 
-        bar_w = 30
-        filled = int(round(consumed_frac * bar_w))
-        bar = Text()
-        bar.append("█" * filled, style="yellow")
-        bar.append("░" * (bar_w - filled), style="bright_black")
-
-        status = Text("  ")
+        # Line 1: status / progress
+        line1 = Text("  ")
         if s.target_reached:
-            status.append("✓", style="bold green")
-            status.append(" target reached  ", style="bold green")
-        elif s.in_flight_size is not None:
-            status.append(self._spinner.render(time.monotonic()))
-            status.append(f" running {s.in_flight_size:<6}", style="yellow")
+            line1.append("✓ ", style="bold green")
+            line1.append(f"complete — {s.crossings} of {s.need} tick crossings observed", style="bold green")
+        elif s.in_flight:
+            line1.append(self._spinner.render(time.monotonic()))
+            line1.append(f" tick {s.crossings + 1} of {s.need}", style="cyan")
+            line1.append(f"  ·  sending {s.in_flight_size} prompt", style="dim")
         else:
-            status.append("✓", style="green")
-            status.append(f" idle  {'':<6}", style="green")
-        status.append("  ")
-        status.append(bar)
-        status.append("  ≈ ", style="bold")
-        status.append(f"{int(round(until_ocw)):>7,}", style="bold yellow")
-        status.append(" OCW until next tick", style="bold")
+            line1.append(f"tick {s.crossings} of {s.need} observed", style="cyan")
 
-        secondary = Text("  ", style="bright_black")
-        secondary.append(f"crossings {s.crossings}/{s.need}")
-        secondary.append("   ·   ")
-        secondary.append(f"cum {int(round(to_ocw(s.cum_input_eq))):,} OCW")
-        secondary.append("   ·   ")
-        secondary.append(f"wall {s.cum_wall_s:.1f}s")
-        secondary.append("   ·   ")
-        secondary.append(f"est/tick ≈ {int(round(to_ocw(s.est_per_tick))):,} OCW")
+        # Line 2: the running answer + trust signal
+        line2 = Text("  ")
+        if s.samples == 0:
+            line2.append("running estimate: ", style="dim")
+            line2.append("(no ticks crossed yet)", style="dim")
+        else:
+            line2.append("running estimate: ", style="dim")
+            line2.append(f"{int(round(s.est_tokens_per_tick)):,} tokens / tick", style="bold")
+            line2.append(f"  (from {s.samples} crossing{'s' if s.samples != 1 else ''}", style="dim")
+            if s.samples >= 2:
+                line2.append(f", spread ±{s.spread_pct:.1f}%", style="dim")
+            line2.append(")", style="dim")
 
-        legend = Text("  ", style="bright_black")
-        legend.append("OCW", style="bold dim")
-        legend.append(" = Opus Cache Write equivalent tokens", style="dim")
-        legend.append("  ·  ", style="dim")
-        legend.append("crossings", style="bold dim")
-        legend.append(" = 1% util boundaries", style="dim")
-        legend.append("  ·  ", style="dim")
-        legend.append(f"{s.other_window} %", style="bold dim")
-        legend.append(" = informational only", style="dim")
+        # Line 3: ETA
+        line3 = Text("  ", style="dim")
+        elapsed = s.cum_wall_s
+        if s.crossings > 0 and not s.target_reached:
+            per_tick_s = elapsed / s.crossings
+            remaining_ticks = max(0, s.need - s.crossings)
+            eta_s = per_tick_s * remaining_ticks
+            line3.append(f"elapsed {elapsed:.0f}s  ·  ETA ~{eta_s:.0f}s")
+        else:
+            line3.append(f"elapsed {elapsed:.0f}s")
 
-        labels = Text("  ")
-        labels.append(_render_column_labels(s.other_window))
+        return Group(Rule(style="bright_black"), line1, line2, line3)
 
-        return Group(
-            Rule(style="bright_black"),
-            labels,
-            status,
-            secondary,
-            legend,
-        )
+
+# --------------------------------------------------------------------------
+# Post-flight: HEADLINE result first, then per-tick bracket table.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _PerTickSummary:
+    tick_num: int
+    util_pre: int
+    util_post: int
+    units: float                       # input-equivalent tokens consumed in this tick
+    last_iter_units_before_cross: float  # input-equivalent
+    wall_s: float
+    iter_nums: list[int]
+    crossed: int                       # ticks advanced (>1 = single iter spanned multiple)
+
+
+def _render_postflight(
+    pre: _PreFlightSummary,
+    per_tick: list[_PerTickSummary],
+    total_wall_s: float,
+    interrupted: bool,
+) -> Group:
+    crossed_ticks = [t for t in per_tick if t.crossed > 0]
+    in_flight = [t for t in per_tick if t.crossed == 0]
+
+    title = Rule("Result", style="bold cyan", characters="═")
+
+    if not crossed_ticks:
+        msg = Text("  ")
+        msg.append("No tick crossings observed", style="bold yellow")
+        msg.append(" — the run ended before any 1% boundary was crossed.")
+        return Group(title, msg)
+
+    # Per-tick token cost. Each crossing: tokens_in_tick / ticks_crossed (usually 1).
+    per_tick_tokens = [to_ocw(t.units) / t.crossed for t in crossed_ticks]
+    mid = sum(per_tick_tokens) / len(per_tick_tokens)
+    lo = min(per_tick_tokens)
+    hi = max(per_tick_tokens)
+    spread_pct = (hi - lo) / mid * 100 if mid > 0 else 0.0
+
+    # Headline.
+    headline = Text("  ")
+    headline.append(f"{int(round(mid)):,}", style="bold green")
+    headline.append(" tokens per 1% tick", style="bold")
+    headline.append(f"   ({pre.window} window)", style="dim")
+
+    bracket = Text("  ")
+    bracket.append("range across observed crossings: ", style="dim")
+    bracket.append(f"{int(round(lo)):,} — {int(round(hi)):,}")
+    bracket.append(f"   (spread {spread_pct:.2f}%)", style="dim")
+
+    full_quota = mid * 100
+    quota_line = Text("  ")
+    quota_line.append("→ implied full-window quota: ", style="dim")
+    quota_line.append(f"{int(round(full_quota)):,} tokens", style="bold")
+
+    # Per-tick table — shows the bracket data, the trust signal.
+    table_title = Text("\n  Per-tick measurements (bracket data):", style="bold")
+    cols = [("tick", 5, "l"), ("util", 11, "l"), ("tokens", 12, "r"),
+            ("uncertainty", 18, "r"), ("wall", 9, "r"), ("iters", 7, "r")]
+    sep = "   "
+    header = Text("    ")
+    header.append(sep.join(_pad(lbl, w, a) for lbl, w, a in cols), style="bold dim")
+
+    rows: list[Text] = [header]
+    for t in crossed_ticks:
+        per_tick_t = to_ocw(t.units) / t.crossed
+        last_iter_ocw = to_ocw(t.last_iter_units_before_cross)
+        uncertainty_pct = (last_iter_ocw / per_tick_t * 100) if per_tick_t > 0 else 0.0
+
+        util_s = f"{t.util_pre}→{t.util_post}%"
+        if t.crossed > 1:
+            util_s += f" (×{t.crossed})"
+        cells = [
+            _pad(str(t.tick_num),                                       cols[0][1], cols[0][2]),
+            _pad(util_s,                                                cols[1][1], cols[1][2]),
+            _pad(f"{int(round(per_tick_t)):,}",                         cols[2][1], cols[2][2]),
+            _pad(f"±{int(round(last_iter_ocw)):,} ({uncertainty_pct:.1f}%)",
+                                                                        cols[3][1], cols[3][2]),
+            _pad(f"{t.wall_s:.1f}s",                                    cols[4][1], cols[4][2]),
+            _pad(str(len(t.iter_nums)),                                 cols[5][1], cols[5][2]),
+        ]
+        row = Text("    ")
+        row.append(sep.join(cells))
+        rows.append(row)
+
+    notes: list[Text] = []
+    if in_flight:
+        n = Text("\n  ", style="dim")
+        n.append("note: ", style="bold yellow")
+        n.append(f"{len(in_flight)} tick block(s) in flight (not crossed) — excluded from the headline.")
+        notes.append(n)
+    if interrupted:
+        n = Text("  ", style="dim")
+        n.append("note: ", style="bold yellow")
+        n.append("run was interrupted before reaching the target.")
+        notes.append(n)
+
+    summary_meta = Text("\n  ", style="dim")
+    summary_meta.append(f"observed {len(crossed_ticks)} of {pre.required_crossings} target crossings  ·  "
+                        f"total wall {total_wall_s:.1f}s")
+
+    return Group(title, headline, bracket, quota_line, summary_meta, table_title, *rows, *notes)
 
 
 def main() -> None:
@@ -815,16 +994,18 @@ def main() -> None:
         baseline_zero = bool(manifest["baseline_zero"])
         need = int(manifest["required_crossings"])
         est_units_per_tick = float(manifest["estimated_input_equiv_tokens_per_tick"])
-        current, baseline, next_iter, used_units_since_tick = load_resume_state(run_dir, window)
+        current, baseline, next_iter, used_units_since_tick, msgs_since_tick = load_resume_state(run_dir, window)
         log(
             f"resuming run: {run_dir} "
-            f"(next_iter={next_iter:03d}, used_since_tick={used_units_since_tick:.1f})"
+            f"(next_iter={next_iter:03d}, used_since_tick={used_units_since_tick:.1f}, "
+            f"msgs_in_current_tick={msgs_since_tick})"
         )
     else:
         log("fetching baseline snapshot")
         baseline = snapshot_metrics(run_dir, metrics_url, "000-baseline", model)
         baseline_zero = is_zero_util(baseline[util_key])
         need = target_ticks + 1 - int(baseline_zero)
+        msgs_since_tick = 0
         # // [LAW:one-source-of-truth] the measured per-tick value (from a real
         # probe run on this account) is the initial estimate; the proxy's
         # capacity_usd guess was off by ~7x in practice. Refinement from
@@ -881,13 +1062,35 @@ def main() -> None:
     # iteration loop. file=sys.stderr keeps log output on stderr (matching the
     # rest of the probe) while the final `print(run_dir)` stays on stdout.
     ui_console = Console(file=sys.stderr, force_terminal=sys.stderr.isatty())
+
+    # ─── Pre-flight ───────────────────────────────────────────────────────
+    util_pct_baseline = int(baseline[util_key] * 100 + 1e-9)
+    # Wall-clock estimate: rough ~4s per message, ~5 messages per tick in
+    # healthy operation. This is a hint for the user; refined as the run
+    # progresses by using observed wall-time-per-tick.
+    expected_wall_s = float(need * 5 * 4.0)
+
+    pre = _PreFlightSummary(
+        model=model,
+        window=window,
+        util_pct_baseline=util_pct_baseline,
+        target_ticks=target_ticks,
+        required_crossings=need,
+        est_tokens_per_tick=to_ocw(est_units_per_tick),
+        expected_wall_s=expected_wall_s,
+    )
+    ui_console.print(_render_preflight(pre))
+
+    # Tick-block tracking. Closed tick blocks accumulate for the post-flight
+    # table; the active block is the one currently in flight.
+    closed_ticks: list[_PerTickSummary] = []
+    current_tick_num = tick_delta(current[util_key], baseline[util_key]) + 1
+
     footer = _IterationFooter(_FooterState(
         window=window,
-        other_window=other_window,
         crossings=tick_delta(current[util_key], baseline[util_key]),
         need=need,
-        used_since_tick=used_units_since_tick,
-        est_per_tick=est_units_per_tick,
+        est_tokens_per_tick=to_ocw(est_units_per_tick),
     ))
 
     interrupted = False
@@ -903,16 +1106,39 @@ def main() -> None:
     ticks_seen = tick_delta(current[util_key], baseline[util_key])
     if ticks_seen >= need:
         log(f"resume target already reached: {window} {ticks_seen}/{need}")
+        ui_console.print(Text(""))
+        ui_console.print(Text(
+            "  No tick blocks observed in this invocation "
+            "(resumed into already-complete state).",
+            style="dim",
+        ))
         log("running report.py")
         run_report(script_dir, run_dir)
         log(f"run complete: {run_dir}")
         print(run_dir)
         return
 
+    total_msgs = 0
+    total_units = 0.0
+
+    # Open the first tick block. On resume, msgs_so_far / units_so_far carry
+    # the in-flight state from iterations.jsonl, so the new session continues
+    # the tick counter rather than restarting it at 0.
+    active_tick = _TickBlock(
+        tick_num=current_tick_num,
+        util_pct_at_open=util_pct_baseline + (current_tick_num - 1),
+        target_util_pct=util_pct_baseline + current_tick_num,
+        units_so_far=used_units_since_tick,
+    )
+
     # // [LAW:single-enforcer] the Live block owns the persistent footer for
     # the entire iteration loop. Inside this `with`, calls to ui_console.print
     # emit above the live region; early `return`s exit Live cleanly via __exit__.
     with Live(footer, console=ui_console, refresh_per_second=10, transient=False) as live:
+        ui_console.print(Text(""))
+        ui_console.print(_render_tick_header(active_tick, need))
+        ui_console.print(_render_iter_columns_header())
+
         for iter_num in range(next_iter, 10_000):
             if interrupted:
                 break
@@ -924,7 +1150,7 @@ def main() -> None:
             )
 
             # In-flight: spinner + size label in the footer while claude runs.
-            footer.update(in_flight_size=size_name)
+            footer.update(in_flight=True, in_flight_size=size_name)
             live.refresh()
 
             # Timestamp at the START so each call has a unique prefix and pays
@@ -994,12 +1220,20 @@ def main() -> None:
             new_ticks = tick_delta(snap[util_key], baseline[util_key])
             crossed = max(0, new_ticks - prev_ticks)
 
+            # Bookkeeping: budget consumed AND per-tick state. Per-tick state
+            # carries the *full* (pre-rollover) units; if we cross, the close
+            # snapshot uses these values, and only AFTER the snapshot do we
+            # subtract est_per_tick × crossed for the next tick's overhang.
             used_units_since_tick += iter_units
             observed_units += iter_units
-            if crossed > 0:
-                observed_ticks += crossed
-                est_units_per_tick = observed_units / observed_ticks
-                used_units_since_tick = max(0.0, used_units_since_tick - est_units_per_tick * crossed)
+            msgs_since_tick += 1
+            total_msgs += 1
+            total_units += iter_units
+
+            active_tick.units_so_far = used_units_since_tick
+            active_tick.wall_s += wall_ms / 1000.0
+            active_tick.iter_nums.append(iter_num)
+            active_tick.last_iter_units_before_cross = iter_units
 
             if interrupted:
                 log("running report.py")
@@ -1045,35 +1279,69 @@ def main() -> None:
             # never display fractional percentages we didn't actually measure.
             util_pct_pre = int(current[util_key] * 100 + 1e-9)
             util_pct = int(snap[util_key] * 100 + 1e-9)
-            other_util_pct = int(snap[f"util_{other_window}"] * 100 + 1e-9)
 
-            # Commit the iteration row to scrollback (above the live footer).
+            # Render the iter row above the live footer.
             ui_console.print(
-                "  ",
                 _fmt_iter_row(
                     iter_num=iter_num,
                     size_name=size_name,
                     wall_s=wall_ms / 1000.0,
+                    iter_tokens=to_ocw(iter_units),
                     util_pre=util_pct_pre,
                     util_post=util_pct,
-                    other_util_pct=other_util_pct,
-                    iter_units=iter_units,
-                    est_units_per_tick=est_units_per_tick,
-                    crossings=ticks_now,
-                    need=need,
                     crossed_this_call=crossed,
                 ),
-                sep="",
             )
 
-            # Refresh the live footer with the new totals.
+            if crossed > 0:
+                # Snapshot the closing tick (full pre-rollover units) for post-flight.
+                closed_ticks.append(_PerTickSummary(
+                    tick_num=active_tick.tick_num,
+                    util_pre=active_tick.util_pct_at_open,
+                    util_post=util_pct,
+                    units=active_tick.units_so_far,
+                    last_iter_units_before_cross=active_tick.last_iter_units_before_cross,
+                    wall_s=active_tick.wall_s,
+                    iter_nums=list(active_tick.iter_nums),
+                    crossed=crossed,
+                ))
+                ui_console.print(_render_tick_close(active_tick, crossed))
+
+                # Refine estimate from observed ticks; carry overhang forward.
+                observed_ticks += crossed
+                est_units_per_tick = observed_units / observed_ticks
+                used_units_since_tick = max(0.0, used_units_since_tick - est_units_per_tick * crossed)
+                msgs_since_tick = 0
+
+                if ticks_now < need:
+                    current_tick_num += crossed
+                    active_tick = _TickBlock(
+                        tick_num=current_tick_num,
+                        util_pct_at_open=util_pct,
+                        target_util_pct=util_pct + 1,
+                        units_so_far=used_units_since_tick,
+                    )
+                    ui_console.print(Text(""))
+                    ui_console.print(_render_tick_header(active_tick, need))
+                    ui_console.print(_render_iter_columns_header())
+
+            # Update running estimate from crossed ticks for the live footer.
+            crossed_per_tick_tokens = [to_ocw(t.units) / t.crossed for t in closed_ticks if t.crossed > 0]
+            if crossed_per_tick_tokens:
+                est_mid = sum(crossed_per_tick_tokens) / len(crossed_per_tick_tokens)
+                spread = (max(crossed_per_tick_tokens) - min(crossed_per_tick_tokens)) / est_mid * 100 \
+                    if est_mid > 0 else 0.0
+            else:
+                est_mid = to_ocw(est_units_per_tick)
+                spread = 0.0
+
             footer.update(
                 crossings=ticks_now,
-                cum_input_eq=footer.state.cum_input_eq + iter_units,
                 cum_wall_s=footer.state.cum_wall_s + wall_ms / 1000.0,
-                used_since_tick=used_units_since_tick,
-                est_per_tick=est_units_per_tick,
-                in_flight_size=None,
+                est_tokens_per_tick=est_mid,
+                samples=len(crossed_per_tick_tokens),
+                spread_pct=spread,
+                in_flight=False,
                 target_reached=ticks_now >= need,
             )
 
@@ -1092,8 +1360,34 @@ def main() -> None:
 
     # Live region with transient=False leaves the final footer rendered in
     # place but does not emit a trailing newline; without this, the next
-    # log() lands on the same visual line as the legend's last char.
+    # log() lands on the same visual line as the footer's last char.
     print(file=sys.stderr)
+
+    # If the active tick block didn't close (interrupt or DRY RUN ended mid-
+    # tick), still surface its iters in post-flight — they happened, they
+    # belong in the record. This is the "every iter visible" rule applied
+    # to summary view too.
+    if active_tick.iter_nums and (
+        not closed_ticks or closed_ticks[-1].tick_num != active_tick.tick_num
+    ):
+        closed_ticks.append(_PerTickSummary(
+            tick_num=active_tick.tick_num,
+            util_pre=active_tick.util_pct_at_open,
+            util_post=active_tick.util_pct_at_open,
+            units=active_tick.units_so_far,
+            last_iter_units_before_cross=active_tick.last_iter_units_before_cross,
+            wall_s=active_tick.wall_s,
+            iter_nums=list(active_tick.iter_nums),
+            crossed=0,
+        ))
+
+    # ─── Post-flight ──────────────────────────────────────────────────────
+    ui_console.print(_render_postflight(
+        pre=pre,
+        per_tick=closed_ticks,
+        total_wall_s=footer.state.cum_wall_s,
+        interrupted=interrupted,
+    ))
 
     if interrupted:
         log("running report.py")
