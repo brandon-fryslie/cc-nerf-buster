@@ -1,0 +1,37 @@
+# Builds and pushes cc-nerf-buster to the homelab registry on every push to master.
+#
+# Prerequisites (one-time):
+#   git remote add gitea git@gitea.sanctuary.gdn:brandon-fryslie/cc-nerf-buster.git
+#   git push gitea master
+#
+# The Gitea Actions runner on the LAN has direct access to the registry at
+# 192.168.7.208:5000 — no auth required.
+
+name: docker-build
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: 192.168.7.208:5000/cc-nerf-buster:latest
+          # Registry is HTTP on the LAN; buildx needs the daemon's insecure-registries
+          # config to allow it. Add to /etc/docker/daemon.json on the runner host:
+          #   { "insecure-registries": ["192.168.7.208:5000"] }
