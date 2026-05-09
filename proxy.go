@@ -25,14 +25,14 @@ type Proxy struct {
 	metrics          *Metrics
 	jsonlWriter      *JSONLWriter
 	verbose          bool
-	debugDir         string          // directory for HAR debug dumps on errors; empty = disabled
+	debugWriter      *DebugWriter    // nil = disabled; writes to debug.jsonl on errors
 	downstreamProxy  *url.URL        // nil = direct connect; set = chain through this proxy
 	ca               *CertAuthority  // SSL inspection CA for intercepting CONNECT on captured hosts
 	captureTransport *http.Transport // transport for captured upstream HTTPS requests
 	plainTransport   *http.Transport // transport for non-captured plain HTTP requests
 }
 
-func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter, verbose bool, downstreamProxy *url.URL, ca *CertAuthority, debugDir string) *Proxy {
+func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter, verbose bool, downstreamProxy *url.URL, ca *CertAuthority, debugWriter *DebugWriter) *Proxy {
 	hosts := make(map[string]bool, len(upstreamHosts))
 	for _, h := range upstreamHosts {
 		hosts[h] = true
@@ -63,7 +63,7 @@ func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter
 		metrics:          metrics,
 		jsonlWriter:      jsonlWriter,
 		verbose:          verbose,
-		debugDir:         debugDir,
+		debugWriter:      debugWriter,
 		downstreamProxy:  downstreamProxy,
 		ca:               ca,
 		captureTransport: captureTransport,
@@ -477,8 +477,21 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 	p.metrics.Record(event)
 	p.jsonlWriter.Write(event)
 
-	if len(errors) > 0 {
-		writeHARDump(p.debugDir, start, event.DurationMs, r.Method, upstreamURL, r.Header, reqBodyBytes, resp.StatusCode, resp.Header, respBodyBytes)
+	if len(errors) > 0 && p.debugWriter != nil {
+		p.debugWriter.Write(&DebugEvent{
+			TS:          start,
+			Errors:      errors,
+			Model:       model,
+			Upstream:    hostOnly,
+			DurationMs:  event.DurationMs,
+			ReqMethod:   r.Method,
+			ReqURL:      upstreamURL,
+			ReqHeaders:  flattenHeaders(r.Header),
+			ReqBody:     string(reqBodyBytes),
+			RespStatus:  resp.StatusCode,
+			RespHeaders: flattenHeaders(resp.Header),
+			RespBody:    string(respBodyBytes),
+		})
 	}
 
 	if p.verbose {

@@ -72,6 +72,12 @@ func main() {
 		log.Fatalf("failed to open JSONL log %s: %v", jsonlPath, err)
 	}
 
+	debugPath := filepath.Join(dataDir, "debug.jsonl")
+	debugWriter, err := NewDebugWriter(debugPath)
+	if err != nil {
+		log.Fatalf("failed to open debug log %s: %v", debugPath, err)
+	}
+
 	// Parse downstream proxy URL if provided
 	var downstreamProxy *url.URL
 	if proxyChain != "" {
@@ -88,7 +94,7 @@ func main() {
 		log.Fatalf("failed to initialize CA: %v", err)
 	}
 
-	proxy := NewProxy(upstreams, metrics, jsonlWriter, verbose, downstreamProxy, ca, dataDir)
+	proxy := NewProxy(upstreams, metrics, jsonlWriter, verbose, downstreamProxy, ca, debugWriter)
 
 	// Proxy server
 	proxyServer := &http.Server{
@@ -149,6 +155,7 @@ func main() {
 	proxyServer.Shutdown(shutdownCtx)
 	metricsServer.Shutdown(shutdownCtx)
 	jsonlWriter.Close()
+	debugWriter.Close()
 
 	log.Println("shutdown complete")
 }

@@ -2,161 +2,80 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
-type harHeader struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+// DebugEvent captures a full request/response exchange that produced one or more errors.
+// The Errors field is the canonical "why was this written" — all other fields are context.
+type DebugEvent struct {
+	TS          time.Time         `json:"ts"`
+	Errors      []string          `json:"errors"`
+	Model       *string           `json:"model,omitempty"`
+	Upstream    string            `json:"upstream"`
+	DurationMs  int64             `json:"duration_ms"`
+	ReqMethod   string            `json:"req_method"`
+	ReqURL      string            `json:"req_url"`
+	ReqHeaders  map[string]string `json:"req_headers"`
+	ReqBody     string            `json:"req_body"`
+	RespStatus  int               `json:"resp_status"`
+	RespHeaders map[string]string `json:"resp_headers"`
+	RespBody    string            `json:"resp_body"`
 }
 
-type harPostData struct {
-	MimeType string `json:"mimeType"`
-	Text     string `json:"text"`
+// DebugWriter is an append-only JSONL writer for DebugEvents.
+// Writes are unbuffered since they only happen on errors.
+type DebugWriter struct {
+	mu   sync.Mutex
+	file *os.File
 }
 
-type harContent struct {
-	Size     int    `json:"size"`
-	MimeType string `json:"mimeType"`
-	Text     string `json:"text"`
+func NewDebugWriter(path string) (*DebugWriter, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &DebugWriter{file: f}, nil
 }
 
-type harRequest struct {
-	Method      string       `json:"method"`
-	URL         string       `json:"url"`
-	HTTPVersion string       `json:"httpVersion"`
-	Headers     []harHeader  `json:"headers"`
-	QueryString []harHeader  `json:"queryString"`
-	PostData    *harPostData `json:"postData,omitempty"`
-	HeadersSize int          `json:"headersSize"`
-	BodySize    int          `json:"bodySize"`
+func (w *DebugWriter) Write(event *DebugEvent) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("debug marshal error: %v", err)
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, err := w.file.Write(append(data, '\n')); err != nil {
+		log.Printf("debug write error: %v", err)
+	}
 }
 
-type harResponse struct {
-	Status      int         `json:"status"`
-	StatusText  string      `json:"statusText"`
-	HTTPVersion string      `json:"httpVersion"`
-	Headers     []harHeader `json:"headers"`
-	Content     harContent  `json:"content"`
-	RedirectURL string      `json:"redirectURL"`
-	HeadersSize int         `json:"headersSize"`
-	BodySize    int         `json:"bodySize"`
+func (w *DebugWriter) Close() error {
+	return w.file.Close()
 }
 
-type harTimings struct {
-	Send    int64 `json:"send"`
-	Wait    int64 `json:"wait"`
-	Receive int64 `json:"receive"`
-}
-
-type harEntry struct {
-	StartedDateTime string      `json:"startedDateTime"`
-	Time            int64       `json:"time"`
-	Request         harRequest  `json:"request"`
-	Response        harResponse `json:"response"`
-	Cache           struct{}    `json:"cache"`
-	Timings         harTimings  `json:"timings"`
-}
-
-// sensitiveHeaders are redacted in HAR dumps to avoid leaking credentials.
+// sensitiveHeaders are redacted in debug dumps to avoid logging credentials.
 var sensitiveHeaders = map[string]bool{
 	"x-api-key":     true,
 	"authorization": true,
 	"cookie":        true,
 }
 
-func headersToHAR(h http.Header) []harHeader {
-	out := make([]harHeader, 0, len(h))
+// flattenHeaders collapses http.Header into a plain map, joining multi-value headers
+// and redacting credential headers.
+func flattenHeaders(h http.Header) map[string]string {
+	out := make(map[string]string, len(h))
 	for name, vals := range h {
 		val := strings.Join(vals, ", ")
 		if sensitiveHeaders[strings.ToLower(name)] {
 			val = "[REDACTED]"
 		}
-		out = append(out, harHeader{Name: name, Value: val})
+		out[name] = val
 	}
 	return out
-}
-
-// writeHARDump writes a .har file for a failed request to debugDir.
-// Always called after the response has been fully forwarded to the client.
-func writeHARDump(debugDir string, start time.Time, durationMs int64, reqMethod, reqURL string, reqHeader http.Header, reqBody []byte, respStatus int, respHeader http.Header, respBody []byte) {
-	if debugDir == "" {
-		return
-	}
-
-	reqMIME := reqHeader.Get("Content-Type")
-	if reqMIME == "" {
-		reqMIME = "application/octet-stream"
-	}
-	respMIME := respHeader.Get("Content-Type")
-	if respMIME == "" {
-		respMIME = "application/octet-stream"
-	}
-
-	var postData *harPostData
-	if len(reqBody) > 0 {
-		postData = &harPostData{MimeType: reqMIME, Text: string(reqBody)}
-	}
-
-	entry := harEntry{
-		StartedDateTime: start.UTC().Format(time.RFC3339Nano),
-		Time:            durationMs,
-		Request: harRequest{
-			Method:      reqMethod,
-			URL:         reqURL,
-			HTTPVersion: "HTTP/1.1",
-			Headers:     headersToHAR(reqHeader),
-			QueryString: []harHeader{},
-			PostData:    postData,
-			HeadersSize: -1,
-			BodySize:    len(reqBody),
-		},
-		Response: harResponse{
-			Status:      respStatus,
-			StatusText:  http.StatusText(respStatus),
-			HTTPVersion: "HTTP/1.1",
-			Headers:     headersToHAR(respHeader),
-			Content:     harContent{Size: len(respBody), MimeType: respMIME, Text: string(respBody)},
-			RedirectURL: "",
-			HeadersSize: -1,
-			BodySize:    len(respBody),
-		},
-		Cache:   struct{}{},
-		Timings: harTimings{Send: 0, Wait: durationMs, Receive: 0},
-	}
-
-	type harLog struct {
-		Log struct {
-			Version string `json:"version"`
-			Creator struct {
-				Name    string `json:"name"`
-				Version string `json:"version"`
-			} `json:"creator"`
-			Entries []harEntry `json:"entries"`
-		} `json:"log"`
-	}
-
-	var h harLog
-	h.Log.Version = "1.2"
-	h.Log.Creator.Name = "cc-nerf-buster"
-	h.Log.Creator.Version = "1.0"
-	h.Log.Entries = []harEntry{entry}
-
-	filename := fmt.Sprintf("debug_%s.har", start.UTC().Format("20060102T150405.000Z07"))
-	path := filepath.Join(debugDir, filename)
-
-	data, err := json.MarshalIndent(h, "", "  ")
-	if err != nil {
-		log.Printf("HAR marshal error: %v", err)
-		return
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Printf("HAR write error: %v", err)
-	}
 }
