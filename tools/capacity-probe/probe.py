@@ -27,10 +27,10 @@ The notes describe normal service activity.
 Do not add anything else.
 """
 
-# Sizes calibrated against measured cost on Opus 4.7 (~0.75 input-equiv per
-# prompt char, dominated by cache_write × 2). At ~550k input-equiv per 1%
-# tick: large ≈ 12.5% of tick. medium/small/micro need re-measurement after
-# the per-call overhead was eliminated. Micro is dynamic.
+# Sizes calibrated against measured cost on Opus 4.7 (~0.625 input-equiv per
+# prompt char, dominated by cache_write × 2). Selection thresholds in
+# choose_prompt_size derive from these targets via LARGE/MEDIUM/SMALL_INPUT_EQUIV.
+# Micro is dynamic — sized per call.
 PROMPT_CHAR_TARGETS = {
     "large": 550_000,
     "medium": 25_000,
@@ -95,6 +95,14 @@ def build_micro_prompt(target_input_equiv: float) -> str:
 # first clean run with the probe-config CLAUDE_CONFIG_DIR approach.
 LEAD_TICK_FRACTION = 0.05
 LEAD_PROMPT_INPUT_EQUIV_PER_CHAR = 0.625
+
+# // [LAW:one-source-of-truth] per-size input-equiv costs derive from PROMPT_CHAR_TARGETS
+# so choose_prompt_size thresholds stay in sync with prompt sizes automatically.
+# Large and medium are above the cache threshold (×2 via LEAD_PROMPT_INPUT_EQUIV_PER_CHAR).
+# Small is below the cache threshold (plain input): chars/MICRO_CHARS_PER_TOKEN + output floor.
+LARGE_INPUT_EQUIV = int(PROMPT_CHAR_TARGETS["large"] * LEAD_PROMPT_INPUT_EQUIV_PER_CHAR)    # 343_750
+MEDIUM_INPUT_EQUIV = int(PROMPT_CHAR_TARGETS["medium"] * LEAD_PROMPT_INPUT_EQUIV_PER_CHAR)  #  15_625
+SMALL_INPUT_EQUIV = int(PROMPT_CHAR_TARGETS["small"] / MICRO_CHARS_PER_TOKEN + MICRO_OUTPUT_FLOOR)  # 908
 
 
 def build_lead_prompt(est_units_per_tick: float) -> str:
@@ -347,21 +355,22 @@ def choose_prompt_size(
     #     small overshoot so that measurement #1 starts cleanly. We accept
     #     more iters here as the cost of bounded bracket error.
     #
-    #   * Measurement: ladder large→medium→small→micro, sized so each tier
-    #     is used until ~one-call-worth of its own size remains. Per-call
-    #     costs need re-measurement after the first clean run; thresholds
-    #     were calibrated before per-call overhead was eliminated.
+    #   * Measurement: ladder large→medium→small→micro. Switch down when
+    #     remaining < that tier's own call cost (LARGE/MEDIUM/SMALL_INPUT_EQUIV).
+    #     Absolute thresholds derived from PROMPT_CHAR_TARGETS; window-independent.
     if ticks_seen >= need or est_units_per_tick <= 0:
         return ("large", 0.0)
     remaining_units = max(0.0, est_units_per_tick - used_units_since_tick)
     if is_leading_bracket:
         return ("lead", remaining_units)
-    remaining_ratio = remaining_units / est_units_per_tick
-    if remaining_ratio > 0.15:
+    # // [LAW:one-source-of-truth] switch down when remaining < that tier's own cost so
+    # one more call of the larger size would overshoot. Same absolute thresholds for both
+    # windows — no per-window calibration needed.
+    if remaining_units > LARGE_INPUT_EQUIV:
         size = "large"
-    elif remaining_ratio > 0.04:
+    elif remaining_units > MEDIUM_INPUT_EQUIV:
         size = "medium"
-    elif remaining_ratio > 0.015:
+    elif remaining_units > SMALL_INPUT_EQUIV:
         size = "small"
     else:
         size = "micro"
