@@ -13,7 +13,6 @@ set -euo pipefail
 PROXY_HOST="192.168.7.208"
 LOCAL_CA="${HOME}/cc-nerf-buster-ca.crt"
 HOSTS_ENTRY="${PROXY_HOST}  api.anthropic.com"
-ZSHRC="${HOME}/.zshrc"
 NODE_CA_LINE="export NODE_EXTRA_CA_CERTS=${LOCAL_CA}"
 
 if [[ ! -f "${LOCAL_CA}" ]]; then
@@ -26,13 +25,15 @@ sudo security add-trusted-cert -d -r trustRoot \
   -k /Library/Keychains/System.keychain "${LOCAL_CA}"
 echo "    Trusted."
 
-echo "==> Adding NODE_EXTRA_CA_CERTS to ${ZSHRC}..."
-if grep -qF "${NODE_CA_LINE}" "${ZSHRC}" 2>/dev/null; then
-  echo "    Already present — skipping."
-else
-  echo "${NODE_CA_LINE}" >> "${ZSHRC}"
-  echo "    Added."
-fi
+for rc in "${HOME}/.zshrc" "${HOME}/.bashrc" "${HOME}/.bash_profile"; do
+  echo "==> Adding NODE_EXTRA_CA_CERTS to ${rc}..."
+  if grep -qF "${NODE_CA_LINE}" "${rc}" 2>/dev/null; then
+    echo "    Already present — skipping."
+  else
+    echo "${NODE_CA_LINE}" >> "${rc}"
+    echo "    Added."
+  fi
+done
 
 echo "==> Adding api.anthropic.com to /etc/hosts..."
 if grep -qF "${HOSTS_ENTRY}" /etc/hosts 2>/dev/null; then
@@ -46,7 +47,7 @@ echo ""
 echo "Setup complete."
 echo ""
 echo "Next steps:"
-echo "  1. Reload your shell:  source ${ZSHRC}"
+echo "  1. Reload your shell:  source ~/.zshrc  (or open a new terminal)"
 echo "  2. Verify the proxy cert is serving:"
 echo "     curl -sv https://api.anthropic.com 2>&1 | grep -E 'SSL|issuer|subject|Connected'"
 echo "     You should see 'issuer: O=cc-nerf-buster' in the output."
