@@ -25,13 +25,14 @@ type Proxy struct {
 	metrics          *Metrics
 	jsonlWriter      *JSONLWriter
 	verbose          bool
+	debugDir         string          // directory for HAR debug dumps on errors; empty = disabled
 	downstreamProxy  *url.URL        // nil = direct connect; set = chain through this proxy
 	ca               *CertAuthority  // SSL inspection CA for intercepting CONNECT on captured hosts
 	captureTransport *http.Transport // transport for captured upstream HTTPS requests
 	plainTransport   *http.Transport // transport for non-captured plain HTTP requests
 }
 
-func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter, verbose bool, downstreamProxy *url.URL, ca *CertAuthority) *Proxy {
+func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter, verbose bool, downstreamProxy *url.URL, ca *CertAuthority, debugDir string) *Proxy {
 	hosts := make(map[string]bool, len(upstreamHosts))
 	for _, h := range upstreamHosts {
 		hosts[h] = true
@@ -62,6 +63,7 @@ func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter
 		metrics:          metrics,
 		jsonlWriter:      jsonlWriter,
 		verbose:          verbose,
+		debugDir:         debugDir,
 		downstreamProxy:  downstreamProxy,
 		ca:               ca,
 		captureTransport: captureTransport,
@@ -369,12 +371,15 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 	var errors []string
 	addError := func(code string) { errors = append(errors, code) }
 
-	// Read request body to extract model
-	var model *string
-	var reqBody io.ReadCloser
+	// Read request body to extract model; retain raw bytes for HAR debug dumps.
+	var (
+		model        *string
+		reqBodyBytes []byte
+		reqBody      io.ReadCloser
+	)
 	if r.Body != nil {
 		var err error
-		reqBody, model, err = extractModelFromRequest(r.Body)
+		reqBody, reqBodyBytes, model, err = extractModelFromRequest(r.Body)
 		if err != nil {
 			addError("request_body_unreadable")
 			if p.verbose {
@@ -429,15 +434,19 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream body to client while extracting usage
-	var usage *Usage
+	// Stream body to client while extracting usage.
+	// respBodyBytes is populated for non-streaming responses (used in HAR dumps on error).
+	var (
+		usage         *Usage
+		respBodyBytes []byte
+	)
 	if isStreaming {
 		usage, err = p.streamSSEWithCapture(w, resp.Body)
 		if err != nil {
 			addError("stream_incomplete")
 		}
 	} else {
-		usage, err = p.forwardBodyWithCapture(w, resp.Body)
+		respBodyBytes, usage, err = p.forwardBodyWithCapture(w, resp.Body)
 		if err != nil {
 			addError("parse_error")
 		}
@@ -467,6 +476,10 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 
 	p.metrics.Record(event)
 	p.jsonlWriter.Write(event)
+
+	if len(errors) > 0 {
+		writeHARDump(p.debugDir, start, event.DurationMs, r.Method, upstreamURL, r.Header, reqBodyBytes, resp.StatusCode, resp.Header, respBodyBytes)
+	}
 
 	if p.verbose {
 		modelStr := "unknown"
@@ -555,7 +568,9 @@ func (p *Proxy) streamSSEWithCapture(w http.ResponseWriter, body io.Reader) (*Us
 }
 
 // forwardBodyWithCapture reads the full response body, forwards to client, and extracts usage.
-func (p *Proxy) forwardBodyWithCapture(w http.ResponseWriter, body io.Reader) (*Usage, error) {
+// Returns the raw captured bytes alongside usage so callers can write HAR dumps on error.
+// The client receives all bytes before this function returns — rule #1.
+func (p *Proxy) forwardBodyWithCapture(w http.ResponseWriter, body io.Reader) ([]byte, *Usage, error) {
 	const maxCapture = 10 * 1024 * 1024 // 10MB
 
 	var buf bytes.Buffer
@@ -564,16 +579,17 @@ func (p *Proxy) forwardBodyWithCapture(w http.ResponseWriter, body io.Reader) (*
 
 	written, err := io.Copy(w, tee)
 	if err != nil {
-		return nil, err
+		return buf.Bytes(), nil, err
 	}
 
 	// If there's more data beyond our limit, drain it to the client without capturing
 	if written > maxCapture {
 		io.Copy(w, body)
-		return nil, fmt.Errorf("body exceeded %d bytes", maxCapture)
+		return buf.Bytes(), nil, fmt.Errorf("body exceeded %d bytes", maxCapture)
 	}
 
-	return extractUsageFromBody(buf.Bytes())
+	usage, err := extractUsageFromBody(buf.Bytes())
+	return buf.Bytes(), usage, err
 }
 
 // forwardPlain forwards non-captured HTTP requests as-is.

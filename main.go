@@ -88,7 +88,7 @@ func main() {
 		log.Fatalf("failed to initialize CA: %v", err)
 	}
 
-	proxy := NewProxy(upstreams, metrics, jsonlWriter, verbose, downstreamProxy, ca)
+	proxy := NewProxy(upstreams, metrics, jsonlWriter, verbose, downstreamProxy, ca, dataDir)
 
 	// Proxy server
 	proxyServer := &http.Server{

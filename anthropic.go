@@ -128,19 +128,19 @@ func extractMeta(h http.Header) *RequestMeta {
 }
 
 // extractModelFromRequest reads the request body to find the model field.
-// It returns the body reader (rewound) and the model string.
-func extractModelFromRequest(body io.ReadCloser) (io.ReadCloser, *string, error) {
+// Returns the body reader (rewound), the raw bytes (for HAR debug dumps), and the model string.
+func extractModelFromRequest(body io.ReadCloser) (io.ReadCloser, []byte, *string, error) {
 	data, err := io.ReadAll(body)
 	body.Close()
 	if err != nil {
-		return io.NopCloser(strings.NewReader("")), nil, err
+		return io.NopCloser(strings.NewReader("")), nil, nil, err
 	}
 
 	var req struct {
 		Model string `json:"model"`
 	}
 	if err := json.Unmarshal(data, &req); err != nil {
-		return io.NopCloser(strings.NewReader(string(data))), nil, err
+		return io.NopCloser(strings.NewReader(string(data))), data, nil, err
 	}
 
 	var model *string
@@ -148,7 +148,7 @@ func extractModelFromRequest(body io.ReadCloser) (io.ReadCloser, *string, error)
 		canonical := canonicalModelID(req.Model)
 		model = &canonical
 	}
-	return io.NopCloser(strings.NewReader(string(data))), model, nil
+	return io.NopCloser(strings.NewReader(string(data))), data, model, nil
 }
 
 // modelPricing maps model IDs to their API pricing ($/MTok).
