@@ -602,3 +602,70 @@ func containsError(errors []string, code string) bool {
 	}
 	return false
 }
+
+// ListenTransparent accepts raw TLS connections on addr and intercepts them
+// using SNI to determine the target host. Intended for /etc/hosts-redirect
+// deployments where clients connect directly without a CONNECT proxy.
+// Returns nil on clean shutdown (ctx cancelled).
+func (p *Proxy) ListenTransparent(ctx context.Context, addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return err
+			}
+		}
+		go p.handleTransparentConn(conn)
+	}
+}
+
+// handleTransparentConn performs TLS interception on a raw incoming connection.
+// The SNI from the ClientHello determines the forged cert and upstream host.
+func (p *Proxy) handleTransparentConn(conn net.Conn) {
+	tlsConfig := &tls.Config{
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if hello.ServerName == "" {
+				return nil, fmt.Errorf("client sent no SNI")
+			}
+			return p.ca.CertForHost(hello.ServerName)
+		},
+	}
+	tlsConn := tls.Server(conn, tlsConfig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := tlsConn.HandshakeContext(ctx)
+	cancel()
+	if err != nil {
+		throttledLog("transparent_handshake", "TLS handshake failed: %v — ensure CA cert is trusted and NODE_EXTRA_CA_CERTS is set", err)
+		conn.Close()
+		return
+	}
+
+	host := tlsConn.ConnectionState().ServerName
+	if host == "" {
+		throttledLog("transparent_no_sni", "client connected without SNI; cannot determine upstream host")
+		tlsConn.Close()
+		return
+	}
+
+	inspectHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		req.URL.Scheme = "https"
+		req.URL.Host = host
+		req.Host = host
+		p.forwardWithCapture(w, req)
+	})
+
+	server := &http.Server{Handler: inspectHandler}
+	server.Serve(&singleConnListener{conn: tlsConn})
+}

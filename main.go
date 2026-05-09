@@ -26,13 +26,14 @@ func (s *stringSlice) Set(v string) error {
 
 func main() {
 	var (
-		port        int
-		metricsPort int
-		dataDir     string
-		verbose     bool
-		initCA      bool
-		upstreams   stringSlice
-		proxyChain  string
+		port             int
+		metricsPort      int
+		dataDir          string
+		verbose          bool
+		initCA           bool
+		upstreams        stringSlice
+		proxyChain       string
+		transparentPort  int
 	)
 
 	flag.IntVar(&port, "port", 9480, "Proxy listen port")
@@ -42,6 +43,7 @@ func main() {
 	flag.BoolVar(&initCA, "init-ca", false, "Generate CA certificate and exit")
 	flag.Var(&upstreams, "upstream-url", "Upstream API host to intercept (repeatable, default api.anthropic.com)")
 	flag.StringVar(&proxyChain, "proxy", "", "Downstream proxy to chain through (e.g. http://localhost:8080)")
+	flag.IntVar(&transparentPort, "transparent-port", 0, "Port for transparent TLS interception (0=disabled; use 443 for /etc/hosts redirect mode)")
 	flag.Parse()
 
 	if len(upstreams) == 0 {
@@ -102,8 +104,11 @@ func main() {
 		Handler: metricsMux,
 	}
 
-	// Start servers
-	errCh := make(chan error, 2)
+	// Shutdown context created before servers start so all goroutines can reference it.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 3)
 
 	go func() {
 		log.Printf("proxy listening on :%d", port)
@@ -121,9 +126,15 @@ func main() {
 		errCh <- metricsServer.ListenAndServe()
 	}()
 
-	// Graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	if transparentPort > 0 {
+		go func() {
+			log.Printf("transparent TLS listener on :%d", transparentPort)
+			printTransparentInstructions(transparentPort, dataDir)
+			if err := proxy.ListenTransparent(ctx, fmt.Sprintf(":%d", transparentPort)); err != nil {
+				errCh <- err
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -175,6 +186,32 @@ func printClaudeCodeInstructions(port, metricsPort int, dataDir string) {
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintf(os.Stderr, "  Metrics: http://localhost:%d/metrics\n", metricsPort)
 	fmt.Fprintf(os.Stderr, "  Usage log: %s/usage.jsonl\n", dataDir)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "──────────────────────────────────────────────────────────────")
+	fmt.Fprintln(os.Stderr)
+}
+
+func printTransparentInstructions(port int, dataDir string) {
+	caPath := filepath.Join(dataDir, "ca.crt")
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════╗")
+	fmt.Fprintln(os.Stderr, "║         Transparent TLS Interception Active                 ║")
+	fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════╝")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "  CA cert on this host:  %s\n", caPath)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  One-time setup on client machine (copy ca.crt from this host first):")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "    # 1. Trust the CA:")
+	fmt.Fprintln(os.Stderr, "    sudo security add-trusted-cert -d -r trustRoot \\")
+	fmt.Fprintln(os.Stderr, "      -k /Library/Keychains/System.keychain /path/to/ca.crt")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "    # 2. Node.js CA trust (add to ~/.zshrc — Node ignores system keychain):")
+	fmt.Fprintln(os.Stderr, "    export NODE_EXTRA_CA_CERTS=/path/to/ca.crt")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "    # 3. Route API traffic through this host (add to /etc/hosts):")
+	fmt.Fprintf(os.Stderr, "    <this-host-ip>  api.anthropic.com   # port %d\n", port)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "──────────────────────────────────────────────────────────────")
 	fmt.Fprintln(os.Stderr)
