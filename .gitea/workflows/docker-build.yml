@@ -32,6 +32,3 @@ jobs:
           context: .
           push: true
           tags: 192.168.7.208:5000/cc-nerf-buster:latest
-          # Registry is HTTP on the LAN; buildx needs the daemon's insecure-registries
-          # config to allow it. Add to /etc/docker/daemon.json on the runner host:
-          #   { "insecure-registries": ["192.168.7.208:5000"] }
