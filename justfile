@@ -55,3 +55,7 @@ probe-report RUN_DIR:
 # Recompute and print low/mid/high quota bounds from an existing probe run.
 probe-bounds RUN_DIR:
     python3 tools/capacity-probe/report.py --print-bounds {{RUN_DIR}}
+
+# Compute quota capacity from all observed traffic in usage.jsonl (no quota spent).
+passive-report *ARGS:
+    python3 tools/capacity-probe/passive-report.py {{ARGS}}
