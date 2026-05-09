@@ -21,14 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: network=host
-
       - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: 192.168.7.208:5000/cc-nerf-buster:latest
+        run: |
+          docker build -t 192.168.7.208:5000/cc-nerf-buster:latest .
+          docker push 192.168.7.208:5000/cc-nerf-buster:latest
