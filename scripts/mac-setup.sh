@@ -2,20 +2,24 @@
 # One-time Mac setup to route all Claude Code API traffic through the
 # cc-nerf-buster transparent proxy running on the homelab runner VM.
 #
+# Prerequisite: ~/cc-nerf-buster-ca.crt must already be present.
+# Fetch it via:
+#   ssh ops 'ssh deploy@192.168.7.208 "docker exec $(docker ps -qf ancestor=192.168.7.208:5000/cc-nerf-buster:latest) cat /data/ca.crt"' > ~/cc-nerf-buster-ca.crt
+#
 # Safe to re-run — all mutations are idempotent.
 
 set -euo pipefail
 
 PROXY_HOST="192.168.7.208"
-REMOTE_CA="deploy@${PROXY_HOST}:/opt/nomad-volumes/cc-nerf-buster/ca.crt"
 LOCAL_CA="${HOME}/cc-nerf-buster-ca.crt"
 HOSTS_ENTRY="${PROXY_HOST}  api.anthropic.com"
 ZSHRC="${HOME}/.zshrc"
 NODE_CA_LINE="export NODE_EXTRA_CA_CERTS=${LOCAL_CA}"
 
-echo "==> Fetching CA cert from proxy VM..."
-scp "${REMOTE_CA}" "${LOCAL_CA}"
-echo "    Saved to ${LOCAL_CA}"
+if [[ ! -f "${LOCAL_CA}" ]]; then
+  echo "ERROR: ${LOCAL_CA} not found. Fetch it first (see script header)." >&2
+  exit 1
+fi
 
 echo "==> Trusting CA in macOS system keychain..."
 sudo security add-trusted-cert -d -r trustRoot \
