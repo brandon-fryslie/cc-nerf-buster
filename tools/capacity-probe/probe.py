@@ -1113,22 +1113,12 @@ def main() -> None:
     (run_dir / "claude-output").mkdir(parents=True, exist_ok=True)
 
     # probe-config: persistent Claude config dir for all probe invocations.
-    # Contains credentials (from one-time login) but no CLAUDE.md, so the
-    # global ~/.claude/CLAUDE.md is never injected — per-call overhead ≈ 0.
+    # Has no CLAUDE.md so the global ~/.claude/CLAUDE.md is never injected —
+    # per-call overhead ≈ 0. Requires one-time login:
+    #   CLAUDE_CONFIG_DIR=<probe_config_dir> claude
     # Also holds the empty MCP config (fixed content, not a run artifact).
     probe_config_dir = data_dir / "probe-config"
-    if not args.dry_run:
-        probe_config_dir.mkdir(parents=True, exist_ok=True)
-        creds_path = probe_config_dir / "credentials.json"
-        if not creds_path.exists():
-            die(
-                f"probe-config not authenticated.\n"
-                f"Run once to log in, then Ctrl-C to exit:\n"
-                f"\n"
-                f"  CLAUDE_CONFIG_DIR={probe_config_dir} claude\n"
-                f"\n"
-                f"The probe will reuse these credentials for all calls."
-            )
+    probe_config_dir.mkdir(parents=True, exist_ok=True)
     # Empty MCP config: persistent in probe-config, not per-run. Format must
     # include the mcpServers key for --strict-mcp-config to accept it.
     empty_mcp_config_path = probe_config_dir / "empty-mcp.json"
