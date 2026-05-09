@@ -29,7 +29,8 @@ Do not add anything else.
 
 # Sizes calibrated against measured cost on Opus 4.7 (~0.75 input-equiv per
 # prompt char, dominated by cache_write × 2). At ~550k input-equiv per 1%
-# tick: large lands ~75% of a tick, medium ~3%, small ~1%. Micro is dynamic.
+# tick: large ≈ 12.5% of tick. medium/small/micro need re-measurement after
+# the per-call overhead was eliminated. Micro is dynamic.
 PROMPT_CHAR_TARGETS = {
     "large": 550_000,
     "medium": 25_000,
@@ -83,6 +84,24 @@ def build_micro_prompt(target_input_equiv: float) -> str:
     return MICRO_BASE + body + "\n"
 
 
+# Lead-bracket sizing. The leading bracket has different objectives than the
+# measurement: we don't measure cost during it, but we want the crossing-call
+# to be small so overshoot is bounded — measurement #1 then starts with a
+# tight, known position. Fixed ~5% of est tick achieves that, at the cost of
+# more iters in the leading block.
+#
+# Empirical char-to-input-equiv ratio (from `large` measurements with cache
+# write at 2×): ~0.625 input-equiv/char. Needs re-verification after the
+# first clean run with the probe-config CLAUDE_CONFIG_DIR approach.
+LEAD_TICK_FRACTION = 0.05
+LEAD_PROMPT_INPUT_EQUIV_PER_CHAR = 0.625
+
+
+def build_lead_prompt(est_units_per_tick: float) -> str:
+    target_chars = int(LEAD_TICK_FRACTION * est_units_per_tick / LEAD_PROMPT_INPUT_EQUIV_PER_CHAR)
+    return build_prompt_corpus(target_chars)
+
+
 PROMPTS = {
     name: build_prompt_corpus(target_chars)
     for name, target_chars in PROMPT_CHAR_TARGETS.items()
@@ -94,6 +113,7 @@ PROMPT_STATS = {
     for name, text in PROMPTS.items()
 }
 PROMPT_STATS["micro"] = {"chars": -1, "words": -1}  # dynamic, sized per call
+PROMPT_STATS["lead"] = {"chars": -1, "words": -1}   # dynamic, sized per call
 
 # // [LAW:one-source-of-truth] per-window defaults live in one map keyed by
 # the window string. Every site that needs a per-window default reads from
@@ -315,27 +335,49 @@ def choose_prompt_size(
     need: int,
     est_units_per_tick: float,
     used_units_since_tick: float,
+    is_leading_bracket: bool = False,
 ) -> tuple[str, float]:
     # // [LAW:dataflow-not-control-flow] every iteration follows the same
     # choose-build-send-measure sequence; only the prompt size value changes.
+    #
+    # Two regimes, selected by `is_leading_bracket`:
+    #
+    #   * Leading bracket: fixed ~5% of tick. The leading block is not a
+    #     measurement; its job is to anchor at the next 1% boundary with
+    #     small overshoot so that measurement #1 starts cleanly. We accept
+    #     more iters here as the cost of bounded bracket error.
+    #
+    #   * Measurement: ladder large→medium→small→micro, sized so each tier
+    #     is used until ~one-call-worth of its own size remains. Per-call
+    #     costs need re-measurement after the first clean run; thresholds
+    #     were calibrated before per-call overhead was eliminated.
     if ticks_seen >= need or est_units_per_tick <= 0:
         return ("large", 0.0)
     remaining_units = max(0.0, est_units_per_tick - used_units_since_tick)
+    if is_leading_bracket:
+        return ("lead", remaining_units)
     remaining_ratio = remaining_units / est_units_per_tick
-    if remaining_ratio > 0.50:
+    if remaining_ratio > 0.15:
         size = "large"
-    elif remaining_ratio > 0.20:
+    elif remaining_ratio > 0.04:
         size = "medium"
-    elif remaining_ratio > 0.08:
+    elif remaining_ratio > 0.015:
         size = "small"
     else:
         size = "micro"
     return size, remaining_units
 
 
-def build_prompt(size_name: str, micro_target_input_equiv: float = 0.0) -> str:
+def build_prompt(
+    size_name: str,
+    *,
+    micro_target_input_equiv: float = 0.0,
+    lead_est_units_per_tick: float = 0.0,
+) -> str:
     if size_name == "micro":
         return build_micro_prompt(micro_target_input_equiv)
+    if size_name == "lead":
+        return build_lead_prompt(lead_est_units_per_tick)
     return PROMPTS[size_name]
 
 
@@ -478,6 +520,9 @@ def claude_env(data_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     # [LAW:single-enforcer] the probe owns the Claude subprocess environment so
     # every probe request goes through the same proxy/CA boundary.
+    # CLAUDE_CONFIG_DIR points at the probe-config dir which has credentials
+    # but no CLAUDE.md — eliminating the ~13K OCW per-call overhead that the
+    # global ~/.claude/CLAUDE.md would otherwise inject into every request.
     env.update(
         {
             "https_proxy": proxy_url,
@@ -489,6 +534,7 @@ def claude_env(data_dir: Path) -> dict[str, str]:
             "CURL_CA_BUNDLE": str(ca_cert),
             "REQUESTS_CA_BUNDLE": str(ca_cert),
             "GIT_SSL_CAINFO": str(ca_cert),
+            "CLAUDE_CONFIG_DIR": str(data_dir / "probe-config"),
         }
     )
     return env
@@ -592,7 +638,7 @@ def resolve_continue_run(data_dir: Path, window: str, dry_run: bool) -> Path:
 # the unit once in the pre-flight block.
 # --------------------------------------------------------------------------
 
-SIZE_COLOR = {"large": "magenta", "medium": "blue", "small": "cyan", "micro": "yellow"}
+SIZE_COLOR = {"lead": "green", "large": "magenta", "medium": "blue", "small": "cyan", "micro": "yellow"}
 
 
 @dataclass
@@ -602,12 +648,17 @@ class _Col:
     align: str  # 'l' / 'r' / 'c'
 
 
-# Per-iter row: iter | size | wall | tokens | util% | marker
+# Per-iter row: iter | size | wall | tokens | →tick | util% | marker
+# →tick is the running estimate of OCW remaining until the next tick boundary
+# (post-call). It counts down across iters and snaps back up to ~1 tick after
+# a crossing — that visual rebound is itself a useful signal that the tick
+# was observed.
 _COLS: list[_Col] = [
     _Col("iter",    5, "r"),
     _Col("size",    6, "l"),
     _Col("wall",    6, "r"),
     _Col("tokens", 10, "r"),
+    _Col("→tick", 11, "r"),
     _Col("util",    8, "c"),
     _Col("",       18, "l"),
 ]
@@ -718,7 +769,8 @@ def _fmt_iter_row(
     iter_num: int,
     size_name: str,
     wall_s: float,
-    iter_tokens: float,                 # OCW
+    iter_tokens: float,                 # OCW spent on this call
+    remaining_ocw: float,               # OCW estimated until next tick (post-call)
     util_pre: int,
     util_post: int,
     crossed_this_call: int,
@@ -737,7 +789,8 @@ def _fmt_iter_row(
         (_pad(size_name,                     _COLS[1].width, _COLS[1].align), size_c),
         (_pad(f"{wall_s:.1f}s",              _COLS[2].width, _COLS[2].align), "bright_black"),
         (_pad(f"{int(round(iter_tokens)):,}", _COLS[3].width, _COLS[3].align), "magenta"),
-        (_pad(util_str,                      _COLS[4].width, _COLS[4].align), "yellow"),
+        (_pad(f"{int(round(remaining_ocw)):,}", _COLS[4].width, _COLS[4].align), "cyan"),
+        (_pad(util_str,                      _COLS[5].width, _COLS[5].align), "yellow"),
         (marker, ""),
     ]
 
@@ -1059,6 +1112,29 @@ def main() -> None:
     (run_dir / "prompts").mkdir(parents=True, exist_ok=True)
     (run_dir / "claude-output").mkdir(parents=True, exist_ok=True)
 
+    # probe-config: persistent Claude config dir for all probe invocations.
+    # Contains credentials (from one-time login) but no CLAUDE.md, so the
+    # global ~/.claude/CLAUDE.md is never injected — per-call overhead ≈ 0.
+    # Also holds the empty MCP config (fixed content, not a run artifact).
+    probe_config_dir = data_dir / "probe-config"
+    if not args.dry_run:
+        probe_config_dir.mkdir(parents=True, exist_ok=True)
+        creds_path = probe_config_dir / "credentials.json"
+        if not creds_path.exists():
+            die(
+                f"probe-config not authenticated.\n"
+                f"Run once to log in, then Ctrl-C to exit:\n"
+                f"\n"
+                f"  CLAUDE_CONFIG_DIR={probe_config_dir} claude\n"
+                f"\n"
+                f"The probe will reuse these credentials for all calls."
+            )
+    # Empty MCP config: persistent in probe-config, not per-run. Format must
+    # include the mcpServers key for --strict-mcp-config to accept it.
+    empty_mcp_config_path = probe_config_dir / "empty-mcp.json"
+    if not args.dry_run:
+        empty_mcp_config_path.write_text('{"mcpServers":{}}\n')
+
     log(f"target: {target_ticks} ticks on the {window} window")
     if args.dry_run:
         log(f"DRY RUN: 'echo' replaces 'claude'; will stop after {dry_iterations} iterations. No API calls will be made.")
@@ -1127,7 +1203,10 @@ def main() -> None:
     observed_ticks = 0
 
     cmd_preview = (
-        f"claude -p --model {model} --system-prompt '' --no-session-persistence --tools '' --"
+        f"CLAUDE_CONFIG_DIR={probe_config_dir} "
+        f"claude -p --model {model} --system-prompt '' --no-session-persistence "
+        f"--tools '' --mcp-config {empty_mcp_config_path.name} --strict-mcp-config "
+        f"--no-chrome --effort low --disable-slash-commands --"
         if not args.dry_run
         else "python3 -c 'echo'"
     )
@@ -1237,7 +1316,8 @@ def main() -> None:
             n = f"{iter_num:03d}"
             ticks_seen = tick_delta(current[util_key], baseline[util_key])
             size_name, rem = choose_prompt_size(
-                ticks_seen, need, est_units_per_tick, used_units_since_tick
+                ticks_seen, need, est_units_per_tick, used_units_since_tick,
+                is_leading_bracket=active_tick.is_leading_bracket,
             )
 
             # In-flight: spinner + size label in the footer while claude runs.
@@ -1254,7 +1334,11 @@ def main() -> None:
             # cross — binary-search the boundary. Each non-crossing iter halves
             # the gap; eventually the smallest meaningful prompt (~80 input-equiv
             # output floor) finally tips us over with minimal overshoot.
-            prompt_corpus = build_prompt(size_name, micro_target_input_equiv=rem * 0.5)
+            prompt_corpus = build_prompt(
+                size_name,
+                micro_target_input_equiv=rem * 0.5,
+                lead_est_units_per_tick=est_units_per_tick,
+            )
             prompt = f"Probe timestamp: {utc_now()}\n" + prompt_corpus
             prompt_path = run_dir / "prompts" / f"{n}.txt"
             prompt_path.write_text(prompt)
@@ -1264,7 +1348,23 @@ def main() -> None:
             if not args.dry_run:
                 # [LAW:single-enforcer] `--` is the single boundary that stops the
                 # variadic `--tools` option from consuming the positional prompt.
-                cmd = [cmd_name, "-p", "--model", model, "--system-prompt", "", "--no-session-persistence", "--tools", "", "--", prompt]
+                # CLAUDE_CONFIG_DIR (set in claude_env) eliminates per-call
+                # overhead by using a config dir with no CLAUDE.md. The flags
+                # below further strip tools, session state, MCP, Chrome, and
+                # effort so the only cost is the prompt itself.
+                cmd = [
+                    cmd_name, "-p",
+                    "--model", model,
+                    "--system-prompt", "",
+                    "--no-session-persistence",
+                    "--tools", "",
+                    "--mcp-config", str(empty_mcp_config_path),
+                    "--strict-mcp-config",
+                    "--no-chrome",
+                    "--effort", "low",
+                    "--disable-slash-commands",
+                    "--", prompt,
+                ]
             else:
                 cmd = [cmd_name, "-c", "import sys; print(sys.argv[1])", prompt]
 
@@ -1367,12 +1467,23 @@ def main() -> None:
             util_pct = int(snap[util_key] * 100 + 1e-9)
 
             # Render the iter row above the live footer.
+            #
+            # The remaining-OCW value shown is computed POST-call, against the
+            # current best estimate. Pre-rebase (before any crossing rollover)
+            # so that on a crossing iter the displayed value goes to 0 and the
+            # "← tick crossed" marker explains the rebound; the very next iter
+            # then shows ~one full tick remaining again, making the cadence
+            # legible at a glance.
+            remaining_ocw_pre_rebase = to_ocw(
+                max(0.0, est_units_per_tick - used_units_since_tick)
+            )
             ui_console.print(
                 _fmt_iter_row(
                     iter_num=iter_num,
                     size_name=size_name,
                     wall_s=wall_ms / 1000.0,
                     iter_tokens=to_ocw(iter_units),
+                    remaining_ocw=remaining_ocw_pre_rebase,
                     util_pre=util_pct_pre,
                     util_post=util_pct,
                     crossed_this_call=crossed,
