@@ -194,9 +194,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--window", choices=WINDOW_CHOICES, required=True)
     p.add_argument("--resume", default=None)
     p.add_argument("--continue", dest="continue_latest", action="store_true")
+    # --run-dir: caller has already created the run directory (e.g. with-proxy.sh
+    # pre-creates it so the proxy can write usage.jsonl directly into it). Unlike
+    # --resume, this does not load prior state; the directory is treated as fresh.
+    p.add_argument("--run-dir", dest="run_dir", default=None)
     args = p.parse_args()
     if args.resume and args.continue_latest:
         die("use either --resume <run_dir> or --continue, not both")
+    if args.run_dir and (args.resume or args.continue_latest):
+        die("--run-dir cannot be combined with --resume or --continue")
     return args
 
 
@@ -1116,7 +1122,12 @@ def main() -> None:
 
     script_dir = Path(__file__).resolve().parent
     ts = run_ts()
-    run_dir = Path(args.resume).expanduser() if args.resume else data_dir / "probe-runs" / (f"dryrun-{ts}" if args.dry_run else ts)
+    if args.resume:
+        run_dir = Path(args.resume).expanduser()
+    elif args.run_dir:
+        run_dir = Path(args.run_dir).expanduser()
+    else:
+        run_dir = data_dir / "probe-runs" / (f"dryrun-{ts}" if args.dry_run else ts)
     (run_dir / "raw-metrics").mkdir(parents=True, exist_ok=True)
     (run_dir / "prompts").mkdir(parents=True, exist_ok=True)
     (run_dir / "claude-output").mkdir(parents=True, exist_ok=True)

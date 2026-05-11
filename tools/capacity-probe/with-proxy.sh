@@ -25,12 +25,34 @@ done
 LOG_DIR="${TMPDIR:-/tmp}"
 PROXY_LOG="$(mktemp "${LOG_DIR%/}/cc-nerf-buster-probe.XXXXXX")"
 
+# Pre-compute the probe run directory so the proxy can write its usage.jsonl
+# (and debug.jsonl) directly into it, keeping per-run traffic logs co-located
+# with the rest of that run's artifacts instead of accumulating in the shared
+# data-dir-wide log.
+DATA_DIR="${DATA_DIR:-${HOME}/.local/cc-nerf-buster}"
+DRY_RUN=0
+for arg in "$@"; do
+  if [[ "$arg" == "--dry-run" ]]; then DRY_RUN=1; fi
+done
+RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  RUN_DIR="${DATA_DIR}/probe-runs/dryrun-${RUN_TS}"
+else
+  RUN_DIR="${DATA_DIR}/probe-runs/${RUN_TS}"
+fi
+mkdir -p "${RUN_DIR}"
+USAGE_LOG="${RUN_DIR}/usage.jsonl"
+DEBUG_LOG="${RUN_DIR}/debug.jsonl"
+
 echo "[with-proxy] starting proxy on :${PROXY_PORT} (metrics :${METRICS_PORT}) — log: ${PROXY_LOG}" >&2
+echo "[with-proxy] probe run dir: ${RUN_DIR}" >&2
 # Enable job control so the backgrounded proxy gets its own process group;
 # without this, Ctrl-C in the foreground (probe) is delivered to the proxy
 # too, killing it mid-iteration before the probe can finish gracefully.
 set -m
-"${BINARY}" --port="${PROXY_PORT}" --metrics="${METRICS_PORT}" >"${PROXY_LOG}" 2>&1 &
+"${BINARY}" --port="${PROXY_PORT}" --metrics="${METRICS_PORT}" \
+            --usage-log="${USAGE_LOG}" --debug-log="${DEBUG_LOG}" \
+            >"${PROXY_LOG}" 2>&1 &
 PROXY_PID=$!
 set +m
 
@@ -83,13 +105,7 @@ trap forward_to_probe INT TERM
 # all of the user's pre-existing quota usage to the first iteration.
 # Dry-run can't prime (no real API call), so its baseline is necessarily
 # degenerate — that's an inherent limitation of dry-run on an ephemeral proxy.
-DRY_RUN=0
-for arg in "$@"; do
-  if [[ "$arg" == "--dry-run" ]]; then DRY_RUN=1; fi
-done
-
 if [[ "$DRY_RUN" -eq 0 ]]; then
-  DATA_DIR="${DATA_DIR:-${HOME}/.local/cc-nerf-buster}"
   CA_CERT="${DATA_DIR}/ca.crt"
   if [[ ! -f "${CA_CERT}" ]]; then
     echo "[with-proxy] ERROR: missing CA cert at ${CA_CERT}; run 'just install' first" >&2
@@ -112,7 +128,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   echo "[with-proxy] priming complete" >&2
 fi
 
-uv run --with rich python "${SCRIPT_DIR}/probe.py" "$@" &
+uv run --with rich python "${SCRIPT_DIR}/probe.py" --run-dir="${RUN_DIR}" "$@" &
 PROBE_PID=$!
 PROBE_EXIT=0
 wait "${PROBE_PID}" || PROBE_EXIT=$?

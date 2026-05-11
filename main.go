@@ -29,6 +29,8 @@ func main() {
 		port             int
 		metricsPort      int
 		dataDir          string
+		usageLogPath     string
+		debugLogPath     string
 		verbose          bool
 		initCA           bool
 		upstreams        stringSlice
@@ -39,6 +41,8 @@ func main() {
 	flag.IntVar(&port, "port", 9480, "Proxy listen port")
 	flag.IntVar(&metricsPort, "metrics", 9481, "Prometheus metrics port")
 	flag.StringVar(&dataDir, "data-dir", defaultDataDir(), "Data directory")
+	flag.StringVar(&usageLogPath, "usage-log", "", "Path to usage JSONL log (default: <data-dir>/usage.jsonl)")
+	flag.StringVar(&debugLogPath, "debug-log", "", "Path to debug JSONL log for failed requests (default: <data-dir>/debug.jsonl)")
 	flag.BoolVar(&verbose, "verbose", false, "Log activity to stderr")
 	flag.BoolVar(&initCA, "init-ca", false, "Generate CA certificate and exit")
 	flag.Var(&upstreams, "upstream-url", "Upstream API host to intercept (repeatable, default api.anthropic.com)")
@@ -66,13 +70,27 @@ func main() {
 	// Initialize components
 	metrics := NewMetrics(dataDir)
 
-	jsonlPath := filepath.Join(dataDir, "usage.jsonl")
+	// [LAW:one-source-of-truth] flag wins over data-dir default; both routes
+	// resolve to a single absolute path before any writer opens the file.
+	jsonlPath := usageLogPath
+	if jsonlPath == "" {
+		jsonlPath = filepath.Join(dataDir, "usage.jsonl")
+	}
+	if err := os.MkdirAll(filepath.Dir(jsonlPath), 0755); err != nil {
+		log.Fatalf("failed to create usage log directory %s: %v", filepath.Dir(jsonlPath), err)
+	}
 	jsonlWriter, err := NewJSONLWriter(jsonlPath, metrics)
 	if err != nil {
 		log.Fatalf("failed to open JSONL log %s: %v", jsonlPath, err)
 	}
 
-	debugPath := filepath.Join(dataDir, "debug.jsonl")
+	debugPath := debugLogPath
+	if debugPath == "" {
+		debugPath = filepath.Join(dataDir, "debug.jsonl")
+	}
+	if err := os.MkdirAll(filepath.Dir(debugPath), 0755); err != nil {
+		log.Fatalf("failed to create debug log directory %s: %v", filepath.Dir(debugPath), err)
+	}
 	debugWriter, err := NewDebugWriter(debugPath)
 	if err != nil {
 		log.Fatalf("failed to open debug log %s: %v", debugPath, err)
@@ -123,7 +141,7 @@ func main() {
 			log.Printf("chaining through downstream proxy: %s", downstreamProxy)
 		}
 		log.Printf("JSONL log: %s", jsonlPath)
-		printClaudeCodeInstructions(port, metricsPort, dataDir)
+		printClaudeCodeInstructions(port, metricsPort, dataDir, jsonlPath)
 		errCh <- proxyServer.ListenAndServe()
 	}()
 
@@ -161,7 +179,7 @@ func main() {
 }
 
 // printClaudeCodeInstructions prints copy-pasteable setup instructions for Claude Code.
-func printClaudeCodeInstructions(port, metricsPort int, dataDir string) {
+func printClaudeCodeInstructions(port, metricsPort int, dataDir, usageLogPath string) {
 	proxyURL := fmt.Sprintf("http://localhost:%d", port)
 	caPath := filepath.Join(dataDir, "ca.crt")
 
@@ -192,7 +210,7 @@ func printClaudeCodeInstructions(port, metricsPort int, dataDir string) {
 	fmt.Fprintf(os.Stderr, "      -k /Library/Keychains/System.keychain %s\n", caPath)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintf(os.Stderr, "  Metrics: http://localhost:%d/metrics\n", metricsPort)
-	fmt.Fprintf(os.Stderr, "  Usage log: %s/usage.jsonl\n", dataDir)
+	fmt.Fprintf(os.Stderr, "  Usage log: %s\n", usageLogPath)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "──────────────────────────────────────────────────────────────")
 	fmt.Fprintln(os.Stderr)
