@@ -152,8 +152,10 @@ func extractModelFromRequest(body io.ReadCloser) (io.ReadCloser, []byte, *string
 }
 
 // modelPricing maps model IDs to their API pricing ($/MTok).
-// Used as proportional weights for quota cost estimation — only ratios matter.
-// Model tier ratio: 1/3/5 (haiku/sonnet/opus).
+// Source: docs/pricing.md (Anthropic list price, captured 2026-05-11).
+// These are real USD, not normalized weights — cost values produced by
+// RequestCost are list-price dollars. Update docs/pricing.md and this
+// table together.
 var modelPricing = map[string]struct{ Input, Output float64 }{
 	"claude-haiku-4-5-20251001": {1.00, 5.00},
 	"claude-sonnet-4-6":         {3.00, 15.00},
