@@ -85,4 +85,39 @@ func TestExtractUsageFromSSEHandlesRealProbeStreamShape(t *testing.T) {
 	if usage.InputTokens != 5 || usage.CacheCreationInputTokens != 9165 || usage.CacheReadInputTokens != 6025 || usage.OutputTokens != 15 {
 		t.Fatalf("unexpected usage: %+v", *usage)
 	}
+	if usage.CacheCreation5mInputTokens != 0 || usage.CacheCreation1hInputTokens != 9165 {
+		t.Fatalf("expected 1h cache breakdown to be parsed; got 5m=%d 1h=%d",
+			usage.CacheCreation5mInputTokens, usage.CacheCreation1hInputTokens)
+	}
+}
+
+func TestRequestCostUsesPerTTLCacheRates(t *testing.T) {
+	// Opus 4.7: input $5/MTok. 5m write = 1.25× = $6.25/MTok. 1h write = 2× = $10/MTok.
+	// 1,000,000 cache_creation tokens of each bucket → $6.25 (5m) + $10 (1h) = $16.25.
+	u := &Usage{
+		CacheCreation5mInputTokens: 1_000_000,
+		CacheCreation1hInputTokens: 1_000_000,
+		CacheCreationInputTokens:   2_000_000, // aggregate, consistent with breakdown
+	}
+	cost, ok := RequestCost("claude-opus-4-7", u)
+	if !ok {
+		t.Fatal("expected known model")
+	}
+	if got, want := cost, 16.25; got != want {
+		t.Fatalf("per-TTL cache pricing: got $%.4f want $%.4f", got, want)
+	}
+}
+
+func TestRequestCostFallsBackTo1hWhenBreakdownAbsent(t *testing.T) {
+	// Older API response: only aggregate cache_creation_input_tokens, no breakdown.
+	// Must be billed at the 1h rate (conservative — preserves prior behavior).
+	// 1,000,000 cache_creation tokens × $10/MTok (opus 1h) = $10.
+	u := &Usage{CacheCreationInputTokens: 1_000_000}
+	cost, ok := RequestCost("claude-opus-4-7", u)
+	if !ok {
+		t.Fatal("expected known model")
+	}
+	if got, want := cost, 10.0; got != want {
+		t.Fatalf("fallback to 1h: got $%.4f want $%.4f", got, want)
+	}
 }

@@ -30,6 +30,12 @@ type Usage struct {
 	OutputTokens             int64 `json:"output_tokens"`
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	// Breakdown of CacheCreationInputTokens by TTL bucket. When present, their
+	// sum equals CacheCreationInputTokens and they let RequestCost charge the
+	// correct multiplier per bucket (5m=1.25×, 1h=2.0× base input). Absent on
+	// older API responses — RequestCost falls back to the 1h rate in that case.
+	CacheCreation5mInputTokens int64 `json:"cache_creation_5m_input_tokens,omitempty"`
+	CacheCreation1hInputTokens int64 `json:"cache_creation_1h_input_tokens,omitempty"`
 }
 
 type QuotaInfo struct {
@@ -163,20 +169,36 @@ var modelPricing = map[string]struct{ Input, Output float64 }{
 	"claude-opus-4-7":           {5.00, 25.00},
 }
 
+// Multipliers relative to base input price. Source: docs/pricing.md.
+// These ratios are constant across every current-gen model.
 const (
-	cacheWriteMultiplier = 2.0  // 1-hour cached tokens (was 1.25 pre-Jan 2026)
-	cacheReadMultiplier  = 0.10 // relative to input price
+	cacheWrite5mMultiplier = 1.25 // 5-minute ephemeral cache write
+	cacheWrite1hMultiplier = 2.00 // 1-hour ephemeral cache write
+	cacheReadMultiplier    = 0.10 // cache hit / refresh
 )
 
-// RequestCost computes the weighted cost of a request in API-dollar-equivalent units.
+// RequestCost computes the cost of a request in list-price USD.
 // Returns (cost, true) for known models, or (0, false) for unknown models.
+//
+// Cache-creation tokens are charged at the per-bucket rate when the response
+// provides the breakdown (CacheCreation5m/1hInputTokens). If only the
+// aggregate CacheCreationInputTokens is set — older API responses, or any
+// path that hasn't been updated to capture the breakdown — they fall back to
+// the 1h rate. That's conservative (overcharges any 5m writes by 1.6×)
+// rather than silently undercharging.
 func RequestCost(model string, u *Usage) (float64, bool) {
 	p, ok := modelPricing[canonicalModelID(model)]
 	if !ok {
 		return 0, false
 	}
+	cache5m := u.CacheCreation5mInputTokens
+	cache1h := u.CacheCreation1hInputTokens
+	if cache5m == 0 && cache1h == 0 {
+		cache1h = u.CacheCreationInputTokens
+	}
 	weightedInput := float64(u.InputTokens) +
-		cacheWriteMultiplier*float64(u.CacheCreationInputTokens) +
+		cacheWrite5mMultiplier*float64(cache5m) +
+		cacheWrite1hMultiplier*float64(cache1h) +
 		cacheReadMultiplier*float64(u.CacheReadInputTokens)
 	cost := (p.Input*weightedInput + p.Output*float64(u.OutputTokens)) / 1_000_000
 	return cost, true
@@ -239,6 +261,12 @@ func mergeUsage(base Usage, next Usage) Usage {
 	if next.CacheCreationInputTokens != 0 {
 		base.CacheCreationInputTokens = next.CacheCreationInputTokens
 	}
+	if next.CacheCreation5mInputTokens != 0 {
+		base.CacheCreation5mInputTokens = next.CacheCreation5mInputTokens
+	}
+	if next.CacheCreation1hInputTokens != 0 {
+		base.CacheCreation1hInputTokens = next.CacheCreation1hInputTokens
+	}
 	if next.CacheReadInputTokens != 0 {
 		base.CacheReadInputTokens = next.CacheReadInputTokens
 	}
@@ -281,12 +309,20 @@ func usageFromMap(v any) (Usage, bool) {
 	if !ok {
 		return Usage{}, false
 	}
-	return Usage{
+	u := Usage{
 		InputTokens:              int64FromJSON(m["input_tokens"]),
 		OutputTokens:             int64FromJSON(m["output_tokens"]),
 		CacheCreationInputTokens: int64FromJSON(m["cache_creation_input_tokens"]),
 		CacheReadInputTokens:     int64FromJSON(m["cache_read_input_tokens"]),
-	}, true
+	}
+	// The per-TTL breakdown lives in a nested "cache_creation" object:
+	//   "cache_creation": { "ephemeral_5m_input_tokens": N, "ephemeral_1h_input_tokens": M }
+	// When present, its components sum to cache_creation_input_tokens.
+	if cc, ok := m["cache_creation"].(map[string]any); ok {
+		u.CacheCreation5mInputTokens = int64FromJSON(cc["ephemeral_5m_input_tokens"])
+		u.CacheCreation1hInputTokens = int64FromJSON(cc["ephemeral_1h_input_tokens"])
+	}
+	return u, true
 }
 
 func int64FromJSON(v any) int64 {
