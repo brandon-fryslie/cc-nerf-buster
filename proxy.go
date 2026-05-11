@@ -26,13 +26,14 @@ type Proxy struct {
 	jsonlWriter      *JSONLWriter
 	verbose          bool
 	debugWriter      *DebugWriter    // nil = disabled; writes to debug.jsonl on errors
+	harWriter        *HARWriter      // nil = disabled; writes every captured request to traffic.har
 	downstreamProxy  *url.URL        // nil = direct connect; set = chain through this proxy
 	ca               *CertAuthority  // SSL inspection CA for intercepting CONNECT on captured hosts
 	captureTransport *http.Transport // transport for captured upstream HTTPS requests
 	plainTransport   *http.Transport // transport for non-captured plain HTTP requests
 }
 
-func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter, verbose bool, downstreamProxy *url.URL, ca *CertAuthority, debugWriter *DebugWriter) *Proxy {
+func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter, verbose bool, downstreamProxy *url.URL, ca *CertAuthority, debugWriter *DebugWriter, harWriter *HARWriter) *Proxy {
 	hosts := make(map[string]bool, len(upstreamHosts))
 	for _, h := range upstreamHosts {
 		hosts[h] = true
@@ -64,6 +65,7 @@ func NewProxy(upstreamHosts []string, metrics *Metrics, jsonlWriter *JSONLWriter
 		jsonlWriter:      jsonlWriter,
 		verbose:          verbose,
 		debugWriter:      debugWriter,
+		harWriter:        harWriter,
 		downstreamProxy:  downstreamProxy,
 		ca:               ca,
 		captureTransport: captureTransport,
@@ -491,6 +493,25 @@ func (p *Proxy) forwardWithCapture(w http.ResponseWriter, r *http.Request) {
 			RespStatus:  resp.StatusCode,
 			RespHeaders: flattenHeaders(resp.Header),
 			RespBody:    string(respBodyBytes),
+		})
+	}
+
+	// HAR captures every request (not just failures) when enabled. The probe
+	// uses this to inspect what Claude Code is actually sending — token
+	// counts in usage.jsonl can't tell us what the haiku-side prompt was.
+	if p.harWriter != nil {
+		p.harWriter.Write(&HARCapture{
+			Start:       start,
+			Duration:    time.Since(start),
+			Errors:      errors,
+			Model:       model,
+			ReqMethod:   r.Method,
+			ReqURL:      upstreamURL,
+			ReqHeaders:  r.Header,
+			ReqBody:     reqBodyBytes,
+			RespStatus:  resp.StatusCode,
+			RespHeaders: resp.Header,
+			RespBody:    respBodyBytes,
 		})
 	}
 

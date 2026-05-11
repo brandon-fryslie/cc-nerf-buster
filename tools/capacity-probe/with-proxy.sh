@@ -43,6 +43,7 @@ fi
 mkdir -p "${RUN_DIR}"
 USAGE_LOG="${RUN_DIR}/usage.jsonl"
 DEBUG_LOG="${RUN_DIR}/debug.jsonl"
+HAR_LOG="${RUN_DIR}/traffic.har"
 
 echo "[with-proxy] starting proxy on :${PROXY_PORT} (metrics :${METRICS_PORT}) — log: ${PROXY_LOG}" >&2
 echo "[with-proxy] probe run dir: ${RUN_DIR}" >&2
@@ -52,6 +53,7 @@ echo "[with-proxy] probe run dir: ${RUN_DIR}" >&2
 set -m
 "${BINARY}" --port="${PROXY_PORT}" --metrics="${METRICS_PORT}" \
             --usage-log="${USAGE_LOG}" --debug-log="${DEBUG_LOG}" \
+            --har-log="${HAR_LOG}" \
             >"${PROXY_LOG}" 2>&1 &
 PROXY_PID=$!
 set +m
