@@ -1,5 +1,5 @@
 # Builds and pushes cc-nerf-buster, deploys to Nomad, and syncs the image
-# tag back to home-infra so Terraform always reflects what's running.
+# tag back to homelab-infra so Terraform always reflects what's running.
 
 name: docker-build
 
@@ -11,7 +11,7 @@ on:
 env:
   REGISTRY: 192.168.7.208:5000
   IMAGE: 192.168.7.208:5000/cc-nerf-buster
-  HOME_INFRA_REPO: brandon-fryslie/home-infra
+  HOME_INFRA_REPO: brandon-fryslie/homelab-infra
   GITEA_HOST: gitea.sanctuary.gdn
 
 jobs:
@@ -20,7 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: brandon-fryslie/home-infra/.gitea/actions/builder-utils@master
+      # Fully-qualified host so the runner pulls from gitea instead of the
+      # default GitHub fallback — homelab-infra is gitea-only.
+      - uses: gitea.sanctuary.gdn/brandon-fryslie/homelab-infra/.gitea/actions/builder-utils@master
         id: utils
 
       - name: Build and push
@@ -32,7 +34,7 @@ jobs:
         run: |
           nomad-deploy cc-nerf-buster "${{ env.IMAGE }}:${{ steps.utils.outputs.image-tag }}"
 
-      - name: Sync image tag to home-infra
+      - name: Sync image tag to homelab-infra
         env:
           GITEA_TOKEN: ${{ gitea.token }}
         run: |
