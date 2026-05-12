@@ -1,11 +1,5 @@
-# Builds and pushes cc-nerf-buster to the homelab registry on every push to master.
-#
-# Prerequisites (one-time):
-#   git remote add gitea git@gitea.sanctuary.gdn:brandon-fryslie/cc-nerf-buster.git
-#   git push gitea master
-#
-# The Gitea Actions runner on the LAN has direct access to the registry at
-# 192.168.7.208:5000 — no auth required.
+# Builds and pushes cc-nerf-buster, deploys to Nomad, and syncs the image
+# tag back to home-infra so Terraform always reflects what's running.
 
 name: docker-build
 
@@ -14,14 +8,42 @@ on:
     branches:
       - master
 
+env:
+  REGISTRY: 192.168.7.208:5000
+  IMAGE: 192.168.7.208:5000/cc-nerf-buster
+  HOME_INFRA_REPO: brandon-fryslie/home-infra
+  GITEA_HOST: gitea.sanctuary.gdn
+
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: brandon-fryslie/home-infra/.gitea/actions/builder-utils@master
+        id: utils
 
       - name: Build and push
         run: |
-          docker build -t 192.168.7.208:5000/cc-nerf-buster:latest .
-          docker push 192.168.7.208:5000/cc-nerf-buster:latest
+          docker build -t "${{ env.IMAGE }}:${{ steps.utils.outputs.image-tag }}" .
+          docker push "${{ env.IMAGE }}:${{ steps.utils.outputs.image-tag }}"
+
+      - name: Deploy to Nomad
+        run: |
+          nomad-deploy cc-nerf-buster "${{ env.IMAGE }}:${{ steps.utils.outputs.image-tag }}"
+
+      - name: Sync image tag to home-infra
+        env:
+          GITEA_TOKEN: ${{ gitea.token }}
+        run: |
+          TAG="${{ steps.utils.outputs.image-tag }}"
+          curl -sf \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            "https://${{ env.GITEA_HOST }}/api/v1/repos/${{ env.HOME_INFRA_REPO }}/contents/jobs/cc-nerf-buster.nomad.hcl" \
+            | jq -r '.content' | base64 -d \
+            | update-file-image-tag - "${{ env.IMAGE }}" "${TAG}" \
+            | gitea-update-file \
+                "${{ env.GITEA_HOST }}" \
+                "${{ env.HOME_INFRA_REPO }}" \
+                "jobs/cc-nerf-buster.nomad.hcl" \
+                "ci: update cc-nerf-buster image to ${TAG}"

@@ -134,10 +134,15 @@ func generateCA() (*CertAuthority, []byte, []byte, error) {
 }
 
 // CertForHost returns a TLS certificate for the given hostname,
-// signed by this CA. Results are cached.
+// signed by this CA. Results are cached; expired certs are regenerated.
 func (ca *CertAuthority) CertForHost(host string) (*tls.Certificate, error) {
 	if cached, ok := ca.certCache.Load(host); ok {
-		return cached.(*tls.Certificate), nil
+		cert := cached.(*tls.Certificate)
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err == nil && time.Now().Before(leaf.NotAfter.Add(-5*time.Minute)) {
+			return cert, nil
+		}
+		ca.certCache.Delete(host)
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -157,7 +162,7 @@ func (ca *CertAuthority) CertForHost(host string) (*tls.Certificate, error) {
 		},
 		DNSNames:  []string{host},
 		NotBefore: time.Now().Add(-1 * time.Hour),
-		NotAfter:  time.Now().Add(24 * time.Hour),
+		NotAfter:  time.Now().Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:  x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{
 			x509.ExtKeyUsageServerAuth,
