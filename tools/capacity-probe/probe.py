@@ -21,6 +21,8 @@ from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.text import Text
 
+from crossings import append_crossings
+
 
 PROMPT_HEADER = """Read the operational notes below and reply with one short sentence:
 The notes describe normal service activity.
@@ -1501,6 +1503,22 @@ def main() -> None:
             )
 
             if crossed > 0:
+                # // [LAW:types-are-the-program] Additive seam for convergent-probe
+                # epic (nerf-convergent-probe-xkh.1): record one Crossing per
+                # integer-percent boundary the iter just crossed. Y_before is
+                # cumulative probe tokens before this iter ran; Y_after is the
+                # cumulative after. Together with `k` they form the labeled
+                # position constraint `k*C - Q0 in [Y_before, Y_after]` that the
+                # epic's estimator pairs across observations to bound C.
+                append_crossings(
+                    run_dir,
+                    util_pct_pre=util_pct_pre,
+                    util_pct_post=util_pct,
+                    Y_before=total_units - iter_units,
+                    Y_after=total_units,
+                    iter_num=iter_num,
+                )
+
                 # Close the active block. The leading bracket (first block) is
                 # only the anchor; subsequent blocks are clean per-tick measurements.
                 closed_ticks.append(_PerTickSummary(
