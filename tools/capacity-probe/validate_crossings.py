@@ -133,7 +133,20 @@ def main() -> None:
     print(f"  mean:       {fmt(legacy_mean)} tokens/tick")
     print(f"  spread:     {fmt(legacy_lo)} .. {fmt(legacy_hi)}  (Δ {fmt(legacy_hi - legacy_lo)})")
 
-    new_C = estimate_C(crossings, prior)
+    try:
+        new_C = estimate_C(crossings, prior)
+    except ValueError as e:
+        # Pairwise constraints disjoint with prior (or with each other after
+        # intersection). Route through the same friendly diagnostic the
+        # legacy-spread mismatch uses below, so the user sees a coherent
+        # tool output instead of a bare stack trace.
+        print()
+        print("New estimator: FAILED")
+        print(f"  ✗ {e}")
+        print("  (Hint: the prior may be wrong for this window/run, or the")
+        print("  position constraints are mutually inconsistent — inspect")
+        print("  the crossings table above for the offending pair.)")
+        raise SystemExit(1)
     print()
     print("New estimator (intersection of pairwise constraints):")
     print(f"  C ∈        [{fmt(new_C.lo)}, {fmt(new_C.hi)}]")

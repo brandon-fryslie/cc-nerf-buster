@@ -235,17 +235,26 @@ def derive_crossings_from_iterations(run_dir: Path) -> list[Crossing]:
             if snap is None:
                 continue
             util_pct_post = int(float(snap[util_key]) * 100 + 1e-9)
+            if util_pct_post < util_pct_pre:
+                # // [LAW:no-defensive-null-guards] Loud failure, not silent
+                # recovery: a util drop inside one run means either a quota
+                # window reset, clock skew, or upstream data corruption. The
+                # estimator's pairwise math assumes monotonic util%, and a
+                # silent miscount in this offline debug tool is a worse
+                # outcome than a crash that points at the actual anomaly.
+                raise ValueError(
+                    f"util% went backwards in iter {iter_num}: "
+                    f"{util_pct_pre}% → {util_pct_post}%. "
+                    "Inspect snapshots.jsonl for the anomaly."
+                )
             if util_pct_post > util_pct_pre:
-                crossed = util_pct_post - util_pct_pre
-                group_id = iter_num if crossed > 1 else 0
-                for k in range(util_pct_pre + 1, util_pct_post + 1):
-                    out.append(Crossing(
-                        k=k,
-                        Y_before=Y_before,
-                        Y_after=Y_after,
-                        iter_num=iter_num,
-                        multi_tick_group=group_id,
-                    ))
+                out.extend(build_crossings(
+                    util_pct_pre=util_pct_pre,
+                    util_pct_post=util_pct_post,
+                    Y_before=Y_before,
+                    Y_after=Y_after,
+                    iter_num=iter_num,
+                ))
             util_pct_pre = util_pct_post
     return out
 
