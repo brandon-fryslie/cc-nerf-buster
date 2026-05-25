@@ -109,8 +109,7 @@ class Crossing:
         )
 
 
-def append_crossings(
-    run_dir: Path,
+def build_crossings(
     *,
     util_pct_pre: int,
     util_pct_post: int,
@@ -118,30 +117,49 @@ def append_crossings(
     Y_after: float,
     iter_num: int,
 ) -> list[Crossing]:
-    """Record one Crossing per integer-percent boundary crossed by this iter.
+    """Pure: emit one Crossing per integer-percent boundary crossed by this iter.
 
     If a single iter crosses N>1 boundaries (rare; happens only with iters
-    larger than one tick of quota), N Crossings are recorded sharing the same
-    Y bracket and `multi_tick_group` id (= iter_num).
+    larger than one tick of quota), N Crossings are returned sharing the same
+    Y bracket and `multi_tick_group` id (= iter_num). Returns an empty list
+    when `util_pct_post <= util_pct_pre` (no crossing observed).
+
+    Pure constructor — no I/O. Tests drive this with literal values; the
+    matching writer below handles the file side. [LAW:locality-or-seam]
+    keeps the type construction free of file-system coupling.
     """
     crossed = util_pct_post - util_pct_pre
     if crossed <= 0:
         return []
     group_id = iter_num if crossed > 1 else 0
-    out: list[Crossing] = []
+    return [
+        Crossing(
+            k=k,
+            Y_before=float(Y_before),
+            Y_after=float(Y_after),
+            iter_num=int(iter_num),
+            multi_tick_group=group_id,
+        )
+        for k in range(util_pct_pre + 1, util_pct_post + 1)
+    ]
+
+
+def write_crossings(run_dir: Path, crossings: list[Crossing]) -> None:
+    """Append Crossings to the run directory's position-constraints stream.
+
+    Append-only by design. Mirrors the convention `iterations.jsonl` follows
+    in probe.py — resume picks up at `next_iter`, past iters/crossings are
+    not re-played, so the file does not accumulate duplicates across resume
+    boundaries. The two streams stay in lockstep: each iter in iterations.jsonl
+    that crossed at least one integer percent has matching Crossing rows
+    here, written immediately after the iter's snapshot succeeded.
+    """
+    if not crossings:
+        return
     path = run_dir / POSITION_CONSTRAINTS_FILENAME
     with path.open("a") as f:
-        for k in range(util_pct_pre + 1, util_pct_post + 1):
-            c = Crossing(
-                k=k,
-                Y_before=float(Y_before),
-                Y_after=float(Y_after),
-                iter_num=int(iter_num),
-                multi_tick_group=group_id,
-            )
+        for c in crossings:
             f.write(json.dumps(c.to_json()) + "\n")
-            out.append(c)
-    return out
 
 
 def load_crossings(run_dir: Path) -> list[Crossing]:
