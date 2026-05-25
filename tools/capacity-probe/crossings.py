@@ -28,7 +28,6 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
-import math
 
 
 # Live-recorded position-constraint stream. Distinct from `crossings.jsonl`,
@@ -79,9 +78,15 @@ class Crossing:
 
     `multi_tick_group` is nonzero when a single iter crossed more than one
     integer-percent boundary; all crossings produced by that iter share a
-    group id (and share `Y_before`/`Y_after`). The estimator treats each k
-    in the group as a separate constraint but knows their brackets are not
-    independent.
+    group id (and share `Y_before`/`Y_after`). Same-group pairs do not give
+    independent observations of C and are filtered out by the estimator —
+    see `estimate_C` for why.
+
+    Naming convention: `Y_before` / `Y_after` use the capitalized prefix `Y`
+    to mirror the math notation in the position-constraint formulation
+    (`k·C − Q₀ ∈ [Y_before, Y_after]`); other fields stay snake_case as
+    plain implementation detail. The mixed style is intentional — preserves
+    a direct line of sight from the docstring math to the code.
     """
 
     k: int
@@ -230,19 +235,33 @@ def derive_crossings_from_iterations(run_dir: Path) -> list[Crossing]:
 def estimate_C(crossings: list[Crossing], prior: Interval) -> Interval:
     """Intersect pairwise constraints on C across all observed crossings.
 
-    For each ordered pair (a, b) with k_a < k_b:
+    Each Crossing is a labeled position constraint:
 
-        (k_b - k_a) * C in [Y_b_before - Y_a_after, Y_b_after - Y_a_before]
+        k·C − Q₀ ∈ [Y_before, Y_after]
 
-    The returned interval is the intersection of `prior` with every such pair
-    constraint. Multi-tick-group crossings (multiple k's sharing a Y bracket)
-    are treated as independent constraints; this is correct because each `k`
-    gives a separate position constraint, even though they share a bracket.
+    where Q₀ is the (unknown) quota usage at probe start. **Q₀ cancels
+    under pairwise subtraction**, which is the load-bearing reason the new
+    formulation can include every crossing — including the leading one,
+    which the legacy aggregator had to exclude precisely because it could
+    not model Q₀. For any ordered pair (a, b) with k_a < k_b:
+
+        (k_b − k_a)·C ∈ [Y_b_before − Y_a_after, Y_b_after − Y_a_before]
+
+    The returned interval is the intersection of `prior` with every such
+    pair constraint.
+
+    Same-`multi_tick_group` pairs (two crossings produced by the same iter,
+    sharing one Y bracket) are skipped: the pairwise math degenerates to
+    `(k_b − k_a)·C ∈ [−W, +W]` — symmetric noise around 0 that cannot
+    tighten any sensible C prior and would clash with the prior's lower
+    bound. Same-bracket crossings are not independent observations of C;
+    they are geometric artifacts of one iter crossing multiple boundaries.
 
     # // [LAW:types-are-the-program] the estimator is forced by the type:
     # `Crossing` admits exactly the pairwise-subtraction operation that yields
     # a bound on C. There is no other arithmetic; no averaging of differences,
-    # no special-case "leading bracket" exclusion. Every Crossing participates.
+    # no special-case "leading bracket" exclusion. Q₀ canceling is the type's
+    # gift — the leading bracket workaround becomes structurally unnecessary.
     """
     if not crossings:
         return prior
@@ -251,13 +270,16 @@ def estimate_C(crossings: list[Crossing], prior: Interval) -> Interval:
         for b in crossings[i + 1:]:
             if b.k <= a.k:
                 continue
+            if a.multi_tick_group != 0 and a.multi_tick_group == b.multi_tick_group:
+                continue
             dk = b.k - a.k
             pair_lo = (b.Y_before - a.Y_after) / dk
             pair_hi = (b.Y_after - a.Y_before) / dk
-            if not math.isfinite(pair_lo) or not math.isfinite(pair_hi):
-                continue
-            if pair_lo > pair_hi:
-                # Degenerate pair (shouldn't happen with consistent data).
-                continue
+            # [LAW:no-defensive-null-guards] no isfinite or lo>hi guards:
+            # dk is a positive int from int subtraction; Y_* are finite floats
+            # parsed from JSON with Y_before ≤ Y_after by Crossing construction.
+            # The arithmetic cannot produce NaN/inf or invert the interval.
+            # `Interval.intersect` will raise loudly if a real inconsistency
+            # ever appears — silently continuing would hide upstream bugs.
             result = result.intersect(Interval(pair_lo, pair_hi))
     return result
