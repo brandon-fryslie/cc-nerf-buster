@@ -21,7 +21,14 @@ from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.text import Text
 
-from crossings import build_crossings, write_crossings
+from crossings import (
+    Crossing,
+    Interval,
+    build_crossings,
+    estimate_C,
+    load_crossings,
+    write_crossings,
+)
 
 
 PROMPT_HEADER = """Read the operational notes below and reply with one short sentence:
@@ -137,6 +144,11 @@ DEFAULT_TARGET_TICKS = {
     "5h": 3,
     "7d": 1,
 }
+
+# Prior C interval half-width as a fraction of the default. One knob so the
+# live UI and the postflight cannot disagree about how loose the prior is.
+# [LAW:one-source-of-truth]
+PRIOR_C_SLOP = 0.5
 
 OUTPUT_TO_INPUT_EQUIV = 5.0
 CACHE_CREATE_TO_INPUT_EQUIV = 2.0
@@ -880,10 +892,10 @@ class _FooterState:
     in_flight: bool = False
     in_flight_size: str = ""
     target_reached: bool = False
-    # Running estimate, refined as ticks cross:
-    est_tokens_per_tick: float = 0.0   # OCW
-    samples: int = 0                   # number of crossed ticks contributing
-    spread_pct: float = 0.0            # |max - min| / mid across samples
+    # Live C interval (input-equivalent units; converted to OCW at display).
+    # None until pairwise narrowing kicks in. [LAW:one-source-of-truth]
+    est_interval: "Interval | None" = None
+    estimator_error: str = ""
 
 
 class _IterationFooter:
@@ -910,18 +922,34 @@ class _IterationFooter:
         else:
             line1.append(f"tick {s.crossings} of {s.need} observed", style="cyan")
 
-        # Line 2: the running answer + trust signal
+        # Line 2: the running answer + trust signal.
+        # // [LAW:types-are-the-program] The interval IS the answer; no
+        # midpoint-with-sidecar-spread reconstruction. With <2 crossings the
+        # prior dominates and the half-width is meaningless to display, so we
+        # render a "waiting" label until pairwise narrowing kicks in.
         line2 = Text("  ")
-        if s.samples == 0:
-            line2.append("running estimate: ", style="dim")
-            line2.append("(no ticks crossed yet)", style="dim")
+        line2.append("running estimate: ", style="dim")
+        if s.estimator_error:
+            line2.append("disjoint constraints — ", style="bold red")
+            line2.append(s.estimator_error, style="red")
+        elif s.est_interval is None or s.crossings < 2:
+            if s.crossings == 0:
+                line2.append("(no crossings observed yet)", style="dim")
+            else:
+                line2.append(
+                    f"(need ≥2 crossings to narrow; have {s.crossings})",
+                    style="dim",
+                )
         else:
-            line2.append("running estimate: ", style="dim")
-            line2.append(f"{int(round(s.est_tokens_per_tick)):,} tokens / tick", style="bold")
-            line2.append(f"  (from {s.samples} crossing{'s' if s.samples != 1 else ''}", style="dim")
-            if s.samples >= 2:
-                line2.append(f", spread ±{s.spread_pct:.1f}%", style="dim")
-            line2.append(")", style="dim")
+            mid_ocw = to_ocw(s.est_interval.mid)
+            half_ocw = to_ocw(s.est_interval.width) / 2.0
+            pct = (s.est_interval.width / s.est_interval.mid) * 100 if s.est_interval.mid > 0 else 0.0
+            line2.append(f"{int(round(mid_ocw)):,} tokens/tick", style="bold")
+            line2.append(f"  ±{int(round(half_ocw)):,} (±{pct/2:.1f}%)", style="dim")
+            line2.append(
+                f"  (from {s.crossings} crossing{'s' if s.crossings != 1 else ''})",
+                style="dim",
+            )
 
         # Line 3: ETA
         line3 = Text("  ", style="dim")
@@ -960,17 +988,26 @@ def _render_postflight(
     per_tick: list[_PerTickSummary],
     total_wall_s: float,
     interrupted: bool,
+    *,
+    crossings: list[Crossing],
+    prior: Interval,
     previous: _PreviousRunComparison | None = None,
 ) -> Group:
     """Result panel.
 
-    The post-flight headline reports per-tick token cost averaged across CLEAN
-    measurements only — leading-bracket blocks (no clean starting position) and
-    in-flight blocks (no closing crossing) are surfaced for transparency but
-    excluded from the average. Same rule report.py applies via measured_ticks.
+    The headline is `C_interval`, the pairwise-constraint intersection over
+    every observed Crossing (Q₀ cancels under subtraction, so the leading
+    bracket is no longer excluded — it contributes via every (leading, k)
+    pair). The per-tick table is preserved as a row-by-row sanity view of
+    the underlying measurement resolution. The legacy mean-of-differences
+    appears only as a small consistency-check note.
 
-    `previous` is rendered as a comparison line beneath the headline when both
-    sides have a clean measurement; with no previous run the line is omitted.
+    `previous` is rendered as a comparison line beneath the headline when
+    both sides have a measurement; with no previous run the line is omitted.
+
+    # // [LAW:one-source-of-truth] The C interval here is computed from the
+    # canonical `crossings` list (the live-recorded position-constraint
+    # stream). No parallel midpoint/spread aggregation lives in this panel.
     """
     measured = [t for t in per_tick if t.crossed > 0 and not t.is_leading_bracket]
     leading = [t for t in per_tick if t.is_leading_bracket]
@@ -978,35 +1015,59 @@ def _render_postflight(
 
     title = Rule("Result", style="bold cyan", characters="═")
 
-    if not measured:
+    if not crossings:
         msg = Text("  ")
-        msg.append("Insufficient data — no clean measurements", style="bold yellow")
+        msg.append("Insufficient data — no crossings observed", style="bold yellow")
         msg.append("\n  ", style="dim")
-        msg.append("A clean measurement requires two observed crossings (the first "
-                   "establishes the anchor, subsequent crossings each measure one tick).",
+        msg.append("Each integer-percent crossing is one position constraint "
+                   "on C; pairs of crossings narrow the interval. With zero "
+                   "crossings the prior is all we have.",
                    style="dim")
         msg.append("\n  ", style="dim")
-        if leading:
-            msg.append(f"This run anchored at {leading[0].util_post}% but no further "
-                       "crossings were observed before it ended.", style="dim")
-        else:
-            msg.append("No crossings were observed before the run ended.", style="dim")
+        msg.append(f"Prior: C ∈ [{int(round(to_ocw(prior.lo))):,}, "
+                   f"{int(round(to_ocw(prior.hi))):,}] tokens/tick "
+                   f"(default ±{int(PRIOR_C_SLOP * 100)}%).",
+                   style="dim")
         return Group(title, msg)
 
-    per_tick_tokens = [to_ocw(t.units) / t.crossed for t in measured]
-    mid = sum(per_tick_tokens) / len(per_tick_tokens)
-    lo = min(per_tick_tokens)
-    hi = max(per_tick_tokens)
-    spread_pct = (hi - lo) / mid * 100 if mid > 0 else 0.0
+    # // [LAW:no-defensive-null-guards] estimate_C only raises when the
+    # observed constraints are mutually disjoint (or disjoint with the
+    # prior). We surface that as a first-class result rather than crashing
+    # the report — see nerf-convergent-probe-xkh.1.1 for the multi-tick
+    # crossing case that can produce it.
+    try:
+        C_interval = estimate_C(crossings, prior)
+        estimator_failure: str | None = None
+    except ValueError as exc:
+        C_interval = prior
+        estimator_failure = str(exc)
+
+    mid = to_ocw(C_interval.mid)
+    width = to_ocw(C_interval.width)
+    half = width / 2.0
+    width_pct = (C_interval.width / C_interval.mid) * 100 if C_interval.mid > 0 else 0.0
 
     headline = Text("  ")
-    headline.append(f"{int(round(mid)):,}", style="bold green")
-    headline.append(" tokens per 1% tick", style="bold")
-    headline.append(f"   ({pre.window} window, {len(measured)} clean measurement"
-                    f"{'s' if len(measured) != 1 else ''})", style="dim")
+    if estimator_failure is not None:
+        headline.append("Disjoint constraints — no estimate", style="bold red")
+        headline.append(
+            f"   ({pre.window} window, {len(crossings)} crossing"
+            f"{'s' if len(crossings) != 1 else ''})",
+            style="dim",
+        )
+    else:
+        headline.append(f"{int(round(mid)):,}", style="bold green")
+        headline.append(" tokens per 1% tick", style="bold")
+        headline.append(f"  ±{int(round(half)):,} (±{width_pct/2:.2f}%)", style="dim")
+        headline.append(
+            f"   ({pre.window} window, {len(crossings)} crossing"
+            f"{'s' if len(crossings) != 1 else ''})",
+            style="dim",
+        )
 
     compare_line: Text | None = None
-    if previous is not None and previous.ocw_per_tick > 0:
+    if (estimator_failure is None
+            and previous is not None and previous.ocw_per_tick > 0):
         delta = mid - previous.ocw_per_tick
         pct = (delta / previous.ocw_per_tick) * 100
         abs_pct = abs(pct)
@@ -1028,18 +1089,57 @@ def _render_postflight(
         )
 
     bracket = Text("  ")
-    bracket.append("range across measurements: ", style="dim")
-    bracket.append(f"{int(round(lo)):,} — {int(round(hi)):,}")
-    bracket.append(f"   (spread {spread_pct:.2f}%)", style="dim")
+    if estimator_failure is not None:
+        bracket.append("estimator failure: ", style="bold red")
+        bracket.append(estimator_failure, style="red")
+    else:
+        bracket.append("C ∈ ", style="dim")
+        bracket.append(
+            f"[{int(round(to_ocw(C_interval.lo))):,} — "
+            f"{int(round(to_ocw(C_interval.hi))):,}]"
+        )
+        bracket.append(
+            f"   (interval width {int(round(width)):,} = {width_pct:.2f}% of mid)",
+            style="dim",
+        )
+
+    # Consistency check: legacy spread of clean per-tick midpoints, demoted
+    # from the headline to a sanity-check note. Only useful when N >= 2.
+    # // [LAW:behavior-not-structure] keeps the legacy comparison visible
+    # for one release as a contract check; the new pairwise interval is the
+    # canonical answer, the legacy spread is the regression alarm.
+    consistency_line: Text | None = None
+    if estimator_failure is None and len(measured) >= 2:
+        per_tick_tokens = [to_ocw(t.units) / t.crossed for t in measured]
+        legacy_mid = sum(per_tick_tokens) / len(per_tick_tokens)
+        legacy_lo = min(per_tick_tokens)
+        legacy_hi = max(per_tick_tokens)
+        legacy_spread_pct = (legacy_hi - legacy_lo) / legacy_mid * 100 if legacy_mid > 0 else 0.0
+        overlap = (legacy_lo <= to_ocw(C_interval.hi)
+                   and legacy_hi >= to_ocw(C_interval.lo))
+        consistency_line = Text("  ", style="dim")
+        consistency_line.append("consistency check: ", style="bold dim")
+        consistency_line.append(
+            f"legacy per-tick midpoints span {int(round(legacy_lo)):,} — "
+            f"{int(round(legacy_hi)):,} (spread {legacy_spread_pct:.2f}%); ",
+            style="dim",
+        )
+        if overlap:
+            consistency_line.append("overlaps new interval ✓", style="dim green")
+        else:
+            consistency_line.append("✗ disjoint from new interval", style="bold red")
 
     full_quota = mid * 100
     quota_line = Text("  ")
     quota_line.append("→ implied full-window quota: ", style="dim")
-    quota_line.append(f"{int(round(full_quota)):,} tokens", style="bold")
+    if estimator_failure is None:
+        quota_line.append(f"{int(round(full_quota)):,} tokens", style="bold")
+    else:
+        quota_line.append("(not computed — disjoint constraints)", style="dim red")
 
     table_title = Text("\n  Measurements (bracket data):", style="bold")
     cols = [("#", 3, "l"), ("util", 11, "l"), ("tokens", 12, "r"),
-            ("uncertainty", 18, "r"), ("wall", 9, "r"), ("iters", 7, "r")]
+            ("bracket width", 14, "r"), ("wall", 9, "r"), ("iters", 7, "r")]
     sep = "   "
     header = Text("    ")
     header.append(sep.join(_pad(lbl, w, a) for lbl, w, a in cols), style="bold dim")
@@ -1048,7 +1148,6 @@ def _render_postflight(
     for t in measured:
         per_tick_t = to_ocw(t.units) / t.crossed
         last_iter_ocw = to_ocw(t.last_iter_units_before_cross)
-        uncertainty_pct = (last_iter_ocw / per_tick_t * 100) if per_tick_t > 0 else 0.0
 
         util_s = f"{t.util_pre}→{t.util_post}%"
         if t.crossed > 1:
@@ -1057,8 +1156,7 @@ def _render_postflight(
             _pad(str(t.tick_num),                              cols[0][1], cols[0][2]),
             _pad(util_s,                                       cols[1][1], cols[1][2]),
             _pad(f"{int(round(per_tick_t)):,}",                cols[2][1], cols[2][2]),
-            _pad(f"±{int(round(last_iter_ocw)):,} ({uncertainty_pct:.1f}%)",
-                                                               cols[3][1], cols[3][2]),
+            _pad(f"{int(round(last_iter_ocw)):,}",             cols[3][1], cols[3][2]),
             _pad(f"{t.wall_s:.1f}s",                           cols[4][1], cols[4][2]),
             _pad(str(len(t.iter_nums)),                        cols[5][1], cols[5][2]),
         ]
@@ -1070,11 +1168,12 @@ def _render_postflight(
     if leading:
         lb = leading[0]
         ln = Text("\n  ", style="dim")
-        ln.append("excluded (leading bracket): ", style="bold dim")
+        ln.append("leading bracket: ", style="bold dim")
         ln.append(f"{int(round(to_ocw(lb.units))):,} tokens spent reaching the first "
                   f"crossing at {lb.util_post}%, across {len(lb.iter_nums)} iter"
                   f"{'s' if len(lb.iter_nums) != 1 else ''}. "
-                  "Internal starting position unknown — not a measurement.",
+                  "Contributes as an anchor to the pairwise estimator "
+                  "(Q₀ cancels under subtraction).",
                   style="dim")
         notes.append(ln)
     if in_flight:
@@ -1093,15 +1192,17 @@ def _render_postflight(
 
     summary_meta = Text("\n  ", style="dim")
     summary_meta.append(f"target {pre.required_crossings} crossings  ·  "
-                        f"observed {len(measured) + len(leading)} crossing"
-                        f"{'s' if len(measured) + len(leading) != 1 else ''}  ·  "
-                        f"clean measurements {len(measured)}  ·  "
+                        f"observed {len(crossings)} crossing"
+                        f"{'s' if len(crossings) != 1 else ''}  ·  "
                         f"total wall {total_wall_s:.1f}s")
 
     parts: list[object] = [title, headline]
     if compare_line is not None:
         parts.append(compare_line)
-    parts.extend([bracket, quota_line, summary_meta, table_title, *rows, *notes])
+    parts.append(bracket)
+    if consistency_line is not None:
+        parts.append(consistency_line)
+    parts.extend([quota_line, summary_meta, table_title, *rows, *notes])
     return Group(*parts)
 
 
@@ -1266,11 +1367,28 @@ def main() -> None:
     closed_ticks: list[_PerTickSummary] = []
     measurements_done = 0  # count of clean measurements observed so far
 
+    # In-memory mirror of this run's crossings. Seeded from disk so a resume
+    # keeps full history available to the estimator. [LAW:one-source-of-truth]
+    recorded_crossings: list[Crossing] = load_crossings(run_dir)
+    default_C = DEFAULT_INPUT_EQUIV_PER_TICK[window]
+    prior_C = Interval(
+        lo=default_C * (1.0 - PRIOR_C_SLOP),
+        hi=default_C * (1.0 + PRIOR_C_SLOP),
+    )
+    # Seed the footer interval from the prior + any pre-existing crossings.
+    try:
+        seeded_interval: Interval | None = estimate_C(recorded_crossings, prior_C)
+        seed_err = ""
+    except ValueError as exc:
+        seeded_interval = None
+        seed_err = str(exc)
+
     footer = _IterationFooter(_FooterState(
         window=window,
         crossings=tick_delta(current[util_key], baseline[util_key]),
         need=need,
-        est_tokens_per_tick=0.0,  # no measurement yet; estimate appears once warmed
+        est_interval=seeded_interval,
+        estimator_error=seed_err,
     ))
 
     interrupted = False
@@ -1512,13 +1630,15 @@ def main() -> None:
                 # updated by `total_units += iter_units` earlier in the loop
                 # — see the pre_iter_total local computed below.
                 pre_iter_total = total_units - iter_units
-                write_crossings(run_dir, build_crossings(
+                new_crossings = build_crossings(
                     util_pct_pre=util_pct_pre,
                     util_pct_post=util_pct,
                     Y_before=pre_iter_total,
                     Y_after=total_units,
                     iter_num=iter_num,
-                ))
+                )
+                write_crossings(run_dir, new_crossings)
+                recorded_crossings.extend(new_crossings)
 
                 # Close the active block. The leading bracket (first block) is
                 # only the anchor; subsequent blocks are clean per-tick measurements.
@@ -1563,23 +1683,24 @@ def main() -> None:
                     ui_console.print(_render_tick_header(active_tick, target_measurements))
                     ui_console.print(_render_iter_columns_header())
 
-            # Running estimate for the live footer: clean measurements only.
-            measured_per_tick_tokens = [to_ocw(t.units) / t.crossed for t in closed_ticks
-                                        if not t.is_leading_bracket and t.crossed > 0]
-            if measured_per_tick_tokens:
-                est_mid = sum(measured_per_tick_tokens) / len(measured_per_tick_tokens)
-                spread = (max(measured_per_tick_tokens) - min(measured_per_tick_tokens)) / est_mid * 100 \
-                    if est_mid > 0 else 0.0
-            else:
-                est_mid = 0.0
-                spread = 0.0
+            # Q₀ cancels under pairwise subtraction, so every crossing
+            # contributes — no leading-bracket exclusion. The estimator's
+            # output IS the displayed answer. [LAW:types-are-the-program]
+            try:
+                est_interval = estimate_C(recorded_crossings, prior_C)
+                est_err = ""
+            except ValueError as exc:
+                # Disjoint constraints: hold the last valid interval and
+                # surface the diagnostic — see nerf-convergent-probe-xkh.1.1
+                # for the multi-tick-crossing case this guards against.
+                est_interval = footer.state.est_interval
+                est_err = str(exc)
 
             footer.update(
                 crossings=ticks_now,
                 cum_wall_s=footer.state.cum_wall_s + wall_ms / 1000.0,
-                est_tokens_per_tick=est_mid,
-                samples=len(measured_per_tick_tokens),
-                spread_pct=spread,
+                est_interval=est_interval,
+                estimator_error=est_err,
                 in_flight=False,
                 target_reached=ticks_now >= need,
             )
@@ -1625,11 +1746,15 @@ def main() -> None:
 
     # ─── Post-flight ──────────────────────────────────────────────────────
     previous = compute_previous_comparison(data_dir, run_dir, window)
+    # Re-read from disk so the postflight reads the canonical stream rather
+    # than an in-memory copy that could drift. [LAW:one-source-of-truth]
     ui_console.print(_render_postflight(
         pre=pre,
         per_tick=closed_ticks,
         total_wall_s=footer.state.cum_wall_s,
         interrupted=interrupted,
+        crossings=load_crossings(run_dir),
+        prior=prior_C,
         previous=previous,
     ))
 

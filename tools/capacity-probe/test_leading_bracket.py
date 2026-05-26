@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Tests for leading-bracket exclusion in probe.py UI and report.py.
+"""Postflight + report.py contract tests.
 
-The leading bracket — the cost spent reaching the first observed crossing —
-is NOT a measurement. Its starting position inside the integer percent is
-unknown, so the cost spans an unknown sub-percent slice (anywhere from 0 to
-~1 tick). Accumulating it as if it were 1 tick worth was the bug that
-inflated both the post-flight headline and the proxy's running estimator
-by random partial-tick noise.
+Originally guarded the *legacy* leading-bracket exclusion in the postflight
+headline (mean-of-midpoints aggregator that had to drop the leading bracket
+because Q₀ was unmodeled). With nerf-convergent-probe-xkh.2, the headline
+became `to_ocw(estimate_C(crossings, prior).mid)` — Q₀ cancels under pairwise
+subtraction so the leading bracket now CONTRIBUTES as an anchor rather than
+being excluded. These tests are rewritten to lock in the new contract:
 
-These tests are the regression guard. Run with:
+  - Every observed Crossing contributes to the headline (no exclusion).
+  - Zero crossings ⇒ "Insufficient data — no crossings observed".
+  - In-flight blocks have no associated Crossing, so they cannot move the
+    headline (and the panel still surfaces them as excluded blocks).
+  - Disjoint constraints surface as a first-class diagnostic, not a crash.
+
+The report.py bounds-summary tests at the bottom of this file remain
+unchanged — they cover a separate concern and are still load-bearing.
+
+Run with:
     uv run --with rich python -m pytest tools/capacity-probe/test_leading_bracket.py -v
 """
 from __future__ import annotations
@@ -67,86 +76,151 @@ def _render(post_group, width=160) -> str:
     return buf.getvalue()
 
 
-def test_post_flight_excludes_leading_bracket_from_headline(probe):
-    """The leading bracket (tick_num=0, is_leading_bracket=True) must NOT
-    contribute to the headline tokens-per-tick value. The headline equals
-    the average of the clean measurements only.
+def _prior_for(probe, window: str = "5h"):
+    """Construct the canonical prior interval for a window — same shape the
+    live loop uses, so test assertions match the panel arithmetic exactly."""
+    from crossings import Interval
+    default_C = probe.DEFAULT_INPUT_EQUIV_PER_TICK[window]
+    return Interval(
+        lo=default_C * (1.0 - probe.PRIOR_C_SLOP),
+        hi=default_C * (1.0 + probe.PRIOR_C_SLOP),
+    )
 
-    Leading: 400000 input-equiv (= 200K OCW)
-    Tick 1: 388000 (= 194K OCW)
-    Tick 2: 414000 (= 207K OCW)
 
-    Wrong headline (includes leading): (200K+194K+207K)/3 = 200.33K
-    Correct headline (excludes leading): (194K+207K)/2 = 200.5K
+def _crossing(k: int, Y_before: float, Y_after: float, iter_num: int):
+    from crossings import Crossing
+    return Crossing(k=k, Y_before=Y_before, Y_after=Y_after, iter_num=iter_num)
 
-    Test uses values where the leading bracket would PULL the headline
-    significantly off if it were wrongly included."""
+
+def test_post_flight_leading_bracket_contributes_via_pairwise(probe):
+    """The leading bracket is no longer excluded — it anchors every pair it
+    participates in. With the new estimator, the headline value is the
+    midpoint of `estimate_C(all_crossings, prior)`, and the leading bracket
+    is the lowest-k Crossing that contributes to N-1 pairs."""
+    from crossings import estimate_C
     pre = probe._PreFlightSummary(
         model="claude-opus-4-7", window="5h", util_pct_baseline=5,
         target_ticks=2, required_crossings=3,
         est_tokens_per_tick=200_000.0, expected_wall_s=60.0,
     )
+    # Three crossings with a clean ~400_000 input-equiv per-tick signal.
+    # The leading bracket's bracket width is intentionally wider (its iter
+    # was longer reaching the first crossing) — but it still contributes.
+    crossings = [
+        _crossing(k=6, Y_before=800_000, Y_after=1_000_000, iter_num=3),    # leading
+        _crossing(k=7, Y_before=1_350_000, Y_after=1_400_000, iter_num=5),  # tick 1
+        _crossing(k=8, Y_before=1_750_000, Y_after=1_800_000, iter_num=7),  # tick 2
+    ]
     pt = [
-        # Leading bracket at very different value — would pollute the headline if included
         _summary(probe, tick_num=0, util_pre=5, util_post=6,
                  tokens_input_equiv=1_000_000.0, is_leading_bracket=True),
         _summary(probe, tick_num=1, util_pre=6, util_post=7,
-                 tokens_input_equiv=388_000.0),
+                 tokens_input_equiv=400_000.0),
         _summary(probe, tick_num=2, util_pre=7, util_post=8,
-                 tokens_input_equiv=414_000.0),
+                 tokens_input_equiv=400_000.0),
     ]
-    out = _render(probe._render_postflight(pre=pre, per_tick=pt, total_wall_s=42.0, interrupted=False))
+    prior = _prior_for(probe)
+    expected_mid_ocw = int(round(probe.to_ocw(estimate_C(crossings, prior).mid)))
 
-    # Clean measurements: 388K and 414K input-equiv = 194K and 207K OCW.
-    # Average = 200.5K OCW. If the headline were wrongly using the leading
-    # bracket (500K OCW from the 1M input-equiv), it would land near 300K.
-    assert "200,500" in out, f"headline should be 200,500 (mean of clean measurements only):\n{out}"
-    assert "300," not in out, f"leading bracket leaked into headline:\n{out}"
-    assert "2 clean measurements" in out, "should label count as clean measurements"
-    assert "excluded (leading bracket)" in out, "should surface the leading bracket as excluded"
+    out = _render(probe._render_postflight(
+        pre=pre, per_tick=pt, total_wall_s=42.0, interrupted=False,
+        crossings=crossings, prior=prior,
+    ))
+
+    assert f"{expected_mid_ocw:,}" in out, (
+        f"headline should be {expected_mid_ocw:,} (= to_ocw(estimate_C.mid)):\n{out}"
+    )
+    assert "tokens per 1% tick" in out
+    assert "3 crossings" in out, "should report the count of contributing Crossings"
+    assert "leading bracket" in out, "should still surface the leading bracket as a note"
+    assert "Contributes as an anchor" in out, (
+        "leading-bracket note should advertise pairwise contribution, not exclusion"
+    )
+    # Legacy "excluded (leading bracket)" framing should be gone.
+    assert "excluded (leading bracket)" not in out
 
 
-def test_post_flight_no_clean_measurements_says_unavailable(probe):
-    """If the run produced only the leading bracket (or nothing), the headline
-    must report INSUFFICIENT DATA, not a number."""
+def test_post_flight_no_crossings_says_insufficient(probe):
+    """Zero crossings ⇒ headline must be 'Insufficient data — no crossings
+    observed', and never a fabricated per-tick number."""
     pre = probe._PreFlightSummary(
         model="claude-opus-4-7", window="5h", util_pct_baseline=5,
         target_ticks=2, required_crossings=3,
         est_tokens_per_tick=200_000.0, expected_wall_s=60.0,
     )
-    pt = [_summary(probe, tick_num=0, util_pre=5, util_post=6,
-                   tokens_input_equiv=400_000.0, is_leading_bracket=True)]
-    out = _render(probe._render_postflight(pre=pre, per_tick=pt, total_wall_s=15.0, interrupted=False))
+    pt: list = []  # nothing closed
+    prior = _prior_for(probe)
+    out = _render(probe._render_postflight(
+        pre=pre, per_tick=pt, total_wall_s=15.0, interrupted=False,
+        crossings=[], prior=prior,
+    ))
 
-    assert "Insufficient data" in out, f"expected explicit 'Insufficient data' label:\n{out}"
-    assert "no clean measurements" in out
-    # No fake headline number.
-    assert "tokens per 1% tick" not in out, f"must not print a per-tick number:\n{out}"
+    assert "Insufficient data" in out, f"expected explicit 'Insufficient data':\n{out}"
+    assert "no crossings observed" in out
+    assert "tokens per 1% tick" not in out, "must not print a per-tick number"
 
 
-def test_post_flight_with_in_flight_block_excluded(probe):
-    """An in-flight block (interrupt or DRY RUN cap) is not a measurement
-    and must be excluded from the headline."""
+def test_post_flight_in_flight_block_does_not_move_headline(probe):
+    """An in-flight block (interrupt or DRY RUN cap) produces no Crossing,
+    so it cannot move the headline. The panel must still surface it as an
+    excluded block."""
+    from crossings import estimate_C
     pre = probe._PreFlightSummary(
         model="claude-opus-4-7", window="5h", util_pct_baseline=5,
         target_ticks=2, required_crossings=3,
         est_tokens_per_tick=200_000.0, expected_wall_s=60.0,
     )
+    crossings = [
+        _crossing(k=6, Y_before=800_000, Y_after=1_000_000, iter_num=3),
+        _crossing(k=7, Y_before=1_350_000, Y_after=1_400_000, iter_num=5),
+    ]
     pt = [
         _summary(probe, tick_num=0, util_pre=5, util_post=6,
-                 tokens_input_equiv=400_000.0, is_leading_bracket=True),
+                 tokens_input_equiv=1_000_000.0, is_leading_bracket=True),
         _summary(probe, tick_num=1, util_pre=6, util_post=7,
                  tokens_input_equiv=400_000.0),
-        # In flight at the time the run ended:
         _summary(probe, tick_num=2, util_pre=7, util_post=7,
-                 tokens_input_equiv=100_000.0, crossed=0),
+                 tokens_input_equiv=100_000.0, crossed=0),  # in flight
     ]
-    out = _render(probe._render_postflight(pre=pre, per_tick=pt, total_wall_s=42.0, interrupted=True))
+    prior = _prior_for(probe)
+    expected_mid_ocw = int(round(probe.to_ocw(estimate_C(crossings, prior).mid)))
+    out = _render(probe._render_postflight(
+        pre=pre, per_tick=pt, total_wall_s=42.0, interrupted=True,
+        crossings=crossings, prior=prior,
+    ))
 
-    # Only the one clean measurement (400K input-equiv = 200K OCW) goes into the headline.
-    assert "200,000" in out, f"headline should be 200,000:\n{out}"
-    assert "1 clean measurement" in out
+    assert f"{expected_mid_ocw:,}" in out, (
+        f"headline should be {expected_mid_ocw:,}:\n{out}"
+    )
+    assert "2 crossings" in out
     assert "excluded (in flight)" in out
+
+
+def test_post_flight_disjoint_constraints_surface_diagnostic(probe):
+    """If estimate_C raises ValueError (disjoint pairwise constraints, or
+    constraints disjoint with the prior), the panel must render a
+    first-class diagnostic — not crash."""
+    pre = probe._PreFlightSummary(
+        model="claude-opus-4-7", window="5h", util_pct_baseline=5,
+        target_ticks=2, required_crossings=3,
+        est_tokens_per_tick=200_000.0, expected_wall_s=60.0,
+    )
+    # Pairwise constraint says C ≈ 420_000; prior here is deliberately tight
+    # at [100_000, 200_000] so the intersection is empty.
+    from crossings import Interval
+    crossings = [
+        _crossing(k=30, Y_before=80_000, Y_after=100_000, iter_num=1),
+        _crossing(k=31, Y_before=500_000, Y_after=520_000, iter_num=2),
+    ]
+    tight_prior = Interval(100_000, 200_000)
+    pt: list = []  # no per-tick rows needed for this assertion
+    out = _render(probe._render_postflight(
+        pre=pre, per_tick=pt, total_wall_s=30.0, interrupted=False,
+        crossings=crossings, prior=tight_prior,
+    ))
+
+    assert "Disjoint constraints" in out, f"expected disjoint diagnostic:\n{out}"
+    assert "tokens per 1% tick" not in out, "must not fabricate a per-tick number on failure"
 
 
 def test_build_bounds_summary_no_fallback_to_proxy(report):
