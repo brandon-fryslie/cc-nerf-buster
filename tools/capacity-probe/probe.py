@@ -21,6 +21,8 @@ from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.text import Text
 
+from crossings import build_crossings, write_crossings
+
 
 PROMPT_HEADER = """Read the operational notes below and reply with one short sentence:
 The notes describe normal service activity.
@@ -1501,6 +1503,23 @@ def main() -> None:
             )
 
             if crossed > 0:
+                # // [LAW:types-are-the-program] Additive seam for convergent-probe
+                # epic (nerf-convergent-probe-xkh.1): record one Crossing per
+                # integer-percent boundary the iter just crossed. The split
+                # build/write keeps construction pure and I/O isolated; this
+                # call site composes them as one logical "record crossing"
+                # action. Bracket math depends on `total_units` having been
+                # updated by `total_units += iter_units` earlier in the loop
+                # — see the pre_iter_total local computed below.
+                pre_iter_total = total_units - iter_units
+                write_crossings(run_dir, build_crossings(
+                    util_pct_pre=util_pct_pre,
+                    util_pct_post=util_pct,
+                    Y_before=pre_iter_total,
+                    Y_after=total_units,
+                    iter_num=iter_num,
+                ))
+
                 # Close the active block. The leading bracket (first block) is
                 # only the anchor; subsequent blocks are clean per-tick measurements.
                 closed_ticks.append(_PerTickSummary(
