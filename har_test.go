@@ -38,13 +38,13 @@ func TestHARWriterProducesValidHARDocument(t *testing.T) {
 		RespBody:    []byte("event: message_start\ndata: {}\n\n"),
 	})
 	w.Write(&HARCapture{
-		Start:       time.Date(2026, 5, 11, 12, 51, 29, 0, time.UTC),
-		Duration:    80 * time.Millisecond,
-		ReqMethod:   "POST",
-		ReqURL:      "https://api.anthropic.com/v1/messages",
-		RespStatus:  429,
-		RespBody:    []byte(`{"type":"error"}`),
-		Errors:      []string{"quota_headers_missing"},
+		Start:      time.Date(2026, 5, 11, 12, 51, 29, 0, time.UTC),
+		Duration:   80 * time.Millisecond,
+		ReqMethod:  "POST",
+		ReqURL:     "https://api.anthropic.com/v1/messages",
+		RespStatus: 429,
+		RespBody:   []byte(`{"type":"error"}`),
+		Errors:     []string{"quota_headers_missing"},
 	})
 
 	if err := w.Close(); err != nil {

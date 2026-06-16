@@ -20,6 +20,9 @@ vet:
 test:
     go test ./...
 
+quota-test:
+    uv run --with pytest python -m pytest tools/quota_probe/test_estimator.py tools/quota_probe/test_measure.py -v
+
 clean:
     rm -f cc-nerf-buster
 
@@ -29,22 +32,42 @@ install *ARGS:
 uninstall:
     ./scripts/uninstall.sh
 
+# Fresh event-sourced quota probe: 5h window.
+quota-5h *ARGS:
+    bash tools/quota_probe/with_proxy.sh --window=5h {{ARGS}}
+
+# Fresh event-sourced quota probe: 7d window.
+quota-7d *ARGS:
+    bash tools/quota_probe/with_proxy.sh --window=7d {{ARGS}}
+
+# Fresh quota probe dry-run, 5h: generates synthetic usage.jsonl and reports from it.
+quota-dry-5h *ARGS:
+    python3 tools/quota_probe/measure.py drive --dry-run --window=5h {{ARGS}}
+
+# Fresh quota probe dry-run, 7d: generates synthetic usage.jsonl and reports from it.
+quota-dry-7d *ARGS:
+    python3 tools/quota_probe/measure.py drive --dry-run --window=7d {{ARGS}}
+
+# Regenerate fresh quota report from an existing run directory.
+quota-report RUN_DIR WINDOW:
+    python3 tools/quota_probe/measure.py report {{RUN_DIR}} --window {{WINDOW}} --print
+
 # Note: each probe run targets exactly one window — a single prompt-size knob
 # cannot satisfy both 5h and 7d tick boundaries at the same time.
 #
-# Capacity probe: 5h window.
+# Legacy capacity probe: 5h window.
 probe-5h *ARGS:
     cd tools/capacity-probe && bash with-proxy.sh --window=5h {{ARGS}}
 
-# Capacity probe: 7d window.
+# Legacy capacity probe: 7d window.
 probe-7d *ARGS:
     cd tools/capacity-probe && bash with-proxy.sh --window=7d {{ARGS}}
 
-# Capacity probe dry-run, 5h: exercises every code path with `echo` replacing `claude`.
+# Legacy capacity probe dry-run, 5h: exercises every code path with `echo` replacing `claude`.
 probe-dry-5h *ARGS:
     cd tools/capacity-probe && bash with-proxy.sh --dry-run --window=5h {{ARGS}}
 
-# Capacity probe dry-run, 7d: exercises every code path with `echo` replacing `claude`.
+# Legacy capacity probe dry-run, 7d: exercises every code path with `echo` replacing `claude`.
 probe-dry-7d *ARGS:
     cd tools/capacity-probe && bash with-proxy.sh --dry-run --window=7d {{ARGS}}
 

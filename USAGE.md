@@ -21,14 +21,15 @@ just install
 
 Uninstall with `just uninstall`.
 
-## Run The Probe
+## Run The Fresh Quota Probe
 
-The probe is what generates the numbers in the README. It launches Claude Code with the proxy already wired up via environment variables scoped to the spawned process, drives it in a loop against a single account, watches the utilization gauge tick, and brackets each tick with pre/post observations.
+The fresh quota probe is the authoritative measurement path. It launches Claude Code with the proxy already wired up via environment variables scoped to the spawned process, drives it against a single account, and estimates quota capacity from the run's canonical `usage.jsonl` event stream.
 
-Normal usage is one command:
+Run one quota window at a time:
 
 ```bash
-just probe
+just quota-5h
+just quota-7d
 ```
 
 > [!WARNING]
@@ -37,56 +38,71 @@ just probe
 When it exits, it prints:
 
 - The active org/upstream scope
-- 5h low / midpoint / high bounds
-- 7d low / midpoint / high bounds
-- Pinned-model full-quota and per-1%-tick token projections
+- The selected window's low / midpoint / high bounds
+- Weighted USD per 1% tick and full-window capacity
+- Opus cache-write token projections per 1% tick and full quota
 
-One window at a time:
+Dry-runs exercise the artifact and estimator path without spending quota:
 
 ```bash
-just probe-5h
-just probe-7d
+just quota-dry-5h
+just quota-dry-7d
 ```
 
-If you interrupt the probe, it still prints the summary and the exact resume command. Explicit resume:
+Regenerate the fresh report from an existing run directory:
 
 ```bash
-just probe --continue
+just quota-report /absolute/path/to/run 5h
+just quota-report /absolute/path/to/run 7d
 ```
 
 ## Bounds
 
-Each quota tick is only visible after it's been crossed, so every measured tick is bracketed by:
+Each quota tick is only visible after it's been crossed, so every crossing is bracketed by:
 
 - `pre`: the last observation before the tick
 - `post`: the first observation after the tick
 
-That produces three estimates:
+The estimator pairs crossings to eliminate the unknown quota usage that existed before the probe started. The final interval is:
 
-- `low` / `pre-pre`: lower bound
-- `midpoint`: recommended estimate (midpoint of `pre`/`post` cost)
-- `high` / `post-post`: upper bound
+- `low`: lower bound of all pairwise crossing constraints
+- `midpoint`: selected estimate
+- `high`: upper bound of all pairwise crossing constraints
 
 ## Probe Run Artifacts
 
 Each run directory contains:
 
 - `manifest.json` — run configuration and baseline snapshot
-- `bounds.json` — machine-readable low / midpoint / high bounds
-- `report.md` — human-readable summary
-- `snapshots.jsonl` and `raw-metrics/` — canonical raw inputs
+- `usage.jsonl` — canonical proxy event stream
+- `fresh-bounds.json` — machine-readable low / midpoint / high bounds
+- `fresh-report.md` — human-readable summary
+- `prompts/` and `outputs/` — exact driver inputs and Claude outputs
+- `traffic.har` and `debug.jsonl` — proxy diagnostics
 
 ## Advanced / Rebuild Artifacts
 
 Optional maintenance commands, not part of normal use.
 
 ```bash
-just probe --continue                       # resume most recent matching run
-just probe-report /absolute/path/to/run     # rebuild report.md
-just probe-bounds /absolute/path/to/run     # recompute bounds
+just quota-report /absolute/path/to/run 5h  # recompute fresh bounds/report
+just quota-test                             # Python estimator/driver tests
 just build && just test && just vet         # build and verify the proxy itself
 ```
 
 ## Interpreting Token Counts
 
-`bounds.json` and `report.md` express capacity as weighted USD and token projections. For Opus the useful numbers are usually full-quota input-equivalent tokens and per-1%-tick input-equivalent tokens.
+`fresh-bounds.json` and `fresh-report.md` express capacity as weighted USD and token projections. For Opus the useful numbers are usually cache-write-equivalent tokens per 1% tick and full-window cache-write-equivalent tokens.
+
+## Legacy Capacity Probe
+
+The older `tools/capacity-probe/` workflow remains available for comparison:
+
+```bash
+just probe-5h
+just probe-7d
+just probe-dry-5h
+just probe-dry-7d
+```
+
+New measurements should use `just quota-5h` or `just quota-7d`.
