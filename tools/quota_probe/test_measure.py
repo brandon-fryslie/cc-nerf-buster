@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import json
 
-from tools.quota_probe.measure import DriveConfig, drive
+import pytest
+
+from tools.quota_probe.estimator import Estimate
+from tools.quota_probe.measure import DriveConfig, drive, reject_unusable_active_events
 
 
 def test_dry_run_drive_writes_replayable_artifacts(tmp_path):
@@ -25,3 +28,21 @@ def test_dry_run_drive_writes_replayable_artifacts(tmp_path):
     assert saved["status"] == "estimated"
     assert saved["weighted_usd_per_tick"]["relative_width"] <= 0.20
 
+
+def test_active_run_rejects_unusable_events():
+    estimate = Estimate(
+        schema_version=1,
+        status="insufficient",
+        reason="need_two_independent_crossings",
+        window="5h",
+        scope=None,
+        loaded_events=3,
+        priced_events=0,
+        excluded_events=3,
+        measured_cost_usd=0.0,
+        crossings=[],
+        interval=None,
+        exclusions=[],
+    )
+    with pytest.raises(SystemExit):
+        reject_unusable_active_events(estimate)

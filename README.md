@@ -45,14 +45,21 @@ The single-number quota tells you how big the budget is, but it doesn't tell you
 
 ### Methodology
 
-Each request's tokens are converted into a weighted cost. To estimate the cost of a single 1% tick, the tool brackets each tick by the last observation before it crossed and the first observation after, then multiplies that tick cost by 100 to get the full-quota size.
+Each request's tokens are converted into a weighted cost. The current probe treats `usage.jsonl` as the canonical event stream: for one org/upstream/window scope, every priced event advances cumulative measured cost, and every observed integer-percent utilization change records a crossing bracket.
+
+Each crossing is a position constraint on the unknown per-tick capacity. Pairing two crossings cancels the unknown quota usage that existed before the run started; intersecting all such pairwise constraints yields the final capacity interval. Multiplying the per-tick interval by 100 gives the full-window quota interval.
 
 ```
-weighted_cost(req) = Σ tokens[kind] × model_multiplier × kind_multiplier
-   model_multiplier:  Haiku=1, Sonnet=3, Opus=5
-   kind_multiplier:   input=1, output=5, cache_write=2, cache_read=0.1
+weighted_usd(req) =
+  (
+    model_input_price × (input + 1.25×cache_write_5m + 2×cache_write_1h + 0.1×cache_read)
+    + model_output_price × output
+  ) / 1,000,000
 
-full_quota ≈ (weighted_cost between two adjacent 1% ticks) × 100
+crossing[k] = cost at which utilization crossed k%
+C_interval = intersection over crossing pairs (a,b):
+  C ∈ [(cost_before[b] - cost_after[a]) / (b.k - a.k),
+       (cost_after[b]  - cost_before[a]) / (b.k - a.k)]
 ```
 
 ## The Problem
@@ -71,9 +78,9 @@ So there's no single "magic number" for the quota — it's a weighted budget, no
 
 1. **Intercept.** A local proxy sits between Claude Code and `api.anthropic.com`, parsing every request/response pair and recording the input tokens, output tokens, cache reads, cache writes, and model used.
 2. **Weight.** Each request is converted into a weighted cost using the formula in [Methodology](#methodology) above. The ratios come from the published [API pricing table](https://platform.claude.com/docs/en/about-claude/pricing), and only the ratios matter — not the absolute prices. The internal quota is assumed to be proportional to this weighted cost. That assumption isn't verifiable from outside, since the Claude Code meter doesn't expose its own accounting, but the API pricing ratios are the only published reference point we have to work from.
-3. **Probe.** A driver runs Claude Code sessions in a loop against a single account, advancing the utilization meter tick by tick. After every request, it samples both the accumulated weighted cost and the current utilization percentage.
-4. **Bracket.** For each 1% tick that gets observed, the tool records the last snapshot before the tick crossed and the first snapshot after.
-5. **Scale.** Multiplying the per-tick cost by 100 gives the full-quota size, reported as a low / midpoint / high range from the bracketing step. That result is then projected into whichever token type you want to read it in.
+3. **Probe.** A driver runs Claude Code sessions in a loop against a single account, advancing the utilization meter tick by tick. The proxy writes each request/response pair to the run's `usage.jsonl`.
+4. **Constrain.** For each 1% tick that gets observed, the estimator records the measured-cost bracket containing that crossing. Pairwise crossing constraints eliminate the unknown starting quota usage.
+5. **Scale.** Multiplying the per-tick interval by 100 gives the full-quota interval, reported as low / midpoint / high. That result is then projected into whichever token type you want to read it in.
 
 ## Running It Yourself
 
@@ -85,7 +92,8 @@ To install and run your own capacity probe, see [`USAGE.md`](USAGE.md).
 - `anthropic.go` — request/response parsing and token extraction.
 - `metrics.go` — Prometheus collector and quota-window bookkeeping.
 - `log.go` — canonical JSONL request log.
-- `tools/capacity-probe/` — Python driver that produces the numbers above.
+- `tools/quota_probe/` — fresh event-sourced quota estimator and driver.
+- `tools/capacity-probe/` — legacy Python driver retained for comparison.
 - `AGENTS.md` — architectural constraints for contributors.
 
 ## License

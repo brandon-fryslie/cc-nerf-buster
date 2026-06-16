@@ -20,6 +20,7 @@ from tools.quota_probe.estimator import Estimate, Scope, estimate_usage_log
 
 
 DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_CLAUDE_TIMEOUT_SECONDS = 180
 DEFAULT_TICK_USD = {
     "5h": 2.75,
     "7d": 14.0,
@@ -42,6 +43,7 @@ class DriveConfig:
     target_relative_width: float
     max_iters: int
     dry_run: bool
+    claude_timeout_seconds: int = DEFAULT_CLAUDE_TIMEOUT_SECONDS
 
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
@@ -115,7 +117,8 @@ def claude_env(run_dir: Path) -> dict[str, str]:
     return env
 
 
-def run_claude(prompt: str, *, model: str, run_dir: Path, iter_num: int) -> None:
+def run_claude(prompt: str, *, cfg: DriveConfig, iter_num: int) -> None:
+    run_dir = cfg.run_dir
     prompt_path = run_dir / "prompts" / f"{iter_num:03d}.txt"
     output_path = run_dir / "outputs" / f"{iter_num:03d}.txt"
     prompt_path.write_text(prompt)
@@ -123,7 +126,7 @@ def run_claude(prompt: str, *, model: str, run_dir: Path, iter_num: int) -> None
         "claude",
         "-p",
         "--model",
-        model,
+        cfg.model,
         "--system-prompt",
         "",
         "--no-session-persistence",
@@ -133,7 +136,28 @@ def run_claude(prompt: str, *, model: str, run_dir: Path, iter_num: int) -> None
         prompt,
     ]
     started = time.monotonic()
-    completed = subprocess.run(cmd, env=claude_env(run_dir), text=True, capture_output=True)
+    try:
+        completed = subprocess.run(
+            cmd,
+            env=claude_env(run_dir),
+            text=True,
+            capture_output=True,
+            timeout=cfg.claude_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        output_path.write_text(stdout + stderr)
+        append_jsonl(run_dir / "driver-iterations.jsonl", {
+            "iter": iter_num,
+            "ts": utc_now(),
+            "prompt_chars": len(prompt),
+            "duration_ms": elapsed_ms,
+            "timed_out": True,
+            "output_path": str(output_path),
+        })
+        die(f"claude iter {iter_num} timed out after {cfg.claude_timeout_seconds}s; see {output_path}")
     elapsed_ms = int((time.monotonic() - started) * 1000)
     output_path.write_text(completed.stdout + completed.stderr)
     if completed.returncode != 0:
@@ -275,6 +299,16 @@ def estimate_run(run_dir: Path, window: str, scope: Scope | None = None) -> Esti
     return estimate
 
 
+def reject_unusable_active_events(estimate: Estimate) -> None:
+    if estimate.loaded_events > 0 and estimate.priced_events == 0:
+        reasons = sorted({ex.reason for ex in estimate.exclusions})
+        reason_text = ", ".join(reasons) if reasons else "no priced events"
+        die(
+            "active run produced API events but none had usable usage/quota data "
+            f"({reason_text}); see fresh-report.md and usage.jsonl"
+        )
+
+
 def drive(cfg: DriveConfig) -> Estimate:
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
     (cfg.run_dir / "prompts").mkdir(exist_ok=True)
@@ -295,10 +329,12 @@ def drive(cfg: DriveConfig) -> Estimate:
         )
     else:
         before = usage_log_len(usage_path)
-        run_claude("Reply with exactly: ok", model=cfg.model, run_dir=cfg.run_dir, iter_num=0)
+        run_claude("Reply with exactly: ok", cfg=cfg, iter_num=0)
         wait_for_usage_event(usage_path, before)
 
     estimate = estimate_run(cfg.run_dir, cfg.window)
+    if not cfg.dry_run:
+        reject_unusable_active_events(estimate)
     for iter_num in range(1, cfg.max_iters + 1):
         prompt_chars = prompt_chars_for_estimate(estimate, usd_per_char)
         prompt = build_prompt(prompt_chars)
@@ -315,9 +351,11 @@ def drive(cfg: DriveConfig) -> Estimate:
                 iter_num=iter_num,
             )
         else:
-            run_claude(prompt, model=cfg.model, run_dir=cfg.run_dir, iter_num=iter_num)
+            run_claude(prompt, cfg=cfg, iter_num=iter_num)
             wait_for_usage_event(usage_path, before_len)
         estimate = estimate_run(cfg.run_dir, cfg.window)
+        if not cfg.dry_run:
+            reject_unusable_active_events(estimate)
         if estimate.status == "contaminated":
             die(f"run contaminated: {estimate.reason}")
         if estimate.interval is not None:
@@ -357,6 +395,7 @@ def parse_args() -> argparse.Namespace:
     drive_cmd.add_argument("--model", default=DEFAULT_MODEL)
     drive_cmd.add_argument("--target-relative-width", type=float, default=0.03)
     drive_cmd.add_argument("--max-iters", type=int, default=80)
+    drive_cmd.add_argument("--claude-timeout-seconds", type=int, default=DEFAULT_CLAUDE_TIMEOUT_SECONDS)
     drive_cmd.add_argument("--dry-run", action="store_true")
 
     return p.parse_args()
@@ -378,6 +417,7 @@ def main() -> None:
             target_relative_width=args.target_relative_width,
             max_iters=args.max_iters,
             dry_run=args.dry_run,
+            claude_timeout_seconds=args.claude_timeout_seconds,
         )
         estimate = drive(cfg)
         print(render_report(estimate.to_json()))
@@ -387,4 +427,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
