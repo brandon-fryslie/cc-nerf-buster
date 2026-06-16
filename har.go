@@ -94,10 +94,10 @@ type HARCapture struct {
 }
 
 type HARWriter struct {
-	mu      sync.Mutex
-	file    *os.File
-	first   bool // true until the first entry is written
-	closed  bool
+	mu     sync.Mutex
+	file   *os.File
+	first  bool // true until the first entry is written
+	closed bool
 }
 
 func NewHARWriter(path string) (*HARWriter, error) {
@@ -226,4 +226,3 @@ func harHeaders(h http.Header) []harHeader {
 	}
 	return out
 }
-

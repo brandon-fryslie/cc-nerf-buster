@@ -26,17 +26,17 @@ func (s *stringSlice) Set(v string) error {
 
 func main() {
 	var (
-		port             int
-		metricsPort      int
-		dataDir          string
-		usageLogPath     string
-		debugLogPath     string
-		harLogPath       string
-		verbose          bool
-		initCA           bool
-		upstreams        stringSlice
-		proxyChain       string
-		transparentPort  int
+		port            int
+		metricsPort     int
+		dataDir         string
+		usageLogPath    string
+		debugLogPath    string
+		harLogPath      string
+		verbose         bool
+		initCA          bool
+		upstreams       stringSlice
+		proxyChain      string
+		transparentPort int
 	)
 
 	flag.IntVar(&port, "port", 9480, "Proxy listen port")
