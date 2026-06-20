@@ -35,7 +35,6 @@ def test_active_run_rejects_unusable_events():
         status="insufficient",
         reason="need_two_independent_crossings",
         window="5h",
-        scope=None,
         loaded_events=3,
         priced_events=0,
         excluded_events=3,

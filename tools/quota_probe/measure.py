@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.quota_probe.estimator import Estimate, Scope, estimate_usage_log
+from tools.quota_probe.estimator import Estimate, estimate_usage_log
 
 
 DEFAULT_MODEL = "claude-opus-4-7"
@@ -263,7 +263,6 @@ def render_report(data: dict[str, Any]) -> str:
         f"- Status: `{data['status']}`",
         f"- Reason: `{data['reason']}`" if data["reason"] else "- Reason: `ok`",
         f"- Window: `{data['window']}`",
-        f"- Scope: `{data['scope']}`",
         f"- Events: loaded={data['events']['loaded']} priced={data['events']['priced']} excluded={data['events']['excluded']}",
         f"- Crossings: {data['crossing_count']}",
         "",
@@ -290,11 +289,11 @@ def render_report(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def estimate_run(run_dir: Path, window: str, scope: Scope | None = None) -> Estimate:
+def estimate_run(run_dir: Path, window: str) -> Estimate:
     usage_path = run_dir / "usage.jsonl"
     if not usage_path.exists():
         die(f"missing usage log: {usage_path}")
-    estimate = estimate_usage_log(usage_path, window=window, scope=scope)
+    estimate = estimate_usage_log(usage_path, window=window)
     write_result(run_dir, estimate)
     return estimate
 
@@ -372,12 +371,6 @@ def sum_prompt_chars(run_dir: Path) -> int:
     return total
 
 
-def parse_scope(args: argparse.Namespace) -> Scope | None:
-    if args.org is None and args.upstream is None:
-        return None
-    return Scope(org=args.org or "", upstream=args.upstream or "")
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fresh Claude Code quota measurement")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -385,8 +378,6 @@ def parse_args() -> argparse.Namespace:
     report = sub.add_parser("report", help="estimate from an existing run directory")
     report.add_argument("run_dir", type=Path)
     report.add_argument("--window", choices=("5h", "7d"), required=True)
-    report.add_argument("--org")
-    report.add_argument("--upstream")
     report.add_argument("--print", dest="print_result", action="store_true")
 
     drive_cmd = sub.add_parser("drive", help="generate traffic, then estimate from usage.jsonl")
@@ -404,7 +395,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.cmd == "report":
-        estimate = estimate_run(args.run_dir, args.window, parse_scope(args))
+        estimate = estimate_run(args.run_dir, args.window)
         if args.print_result:
             print(render_report(estimate.to_json()))
         return
