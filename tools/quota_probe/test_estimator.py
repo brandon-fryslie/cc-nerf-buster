@@ -112,8 +112,9 @@ def test_non_measurement_rows_are_skipped_not_aborted():
     # The dedicated proxy logs every request, including ones with no usage or no
     # quota headers (errors, non-message calls). These must be excluded and the
     # run must still produce an estimate from the real measurement points.
-    junk_no_usage = {"model": "claude-opus-4-7", "upstream": "api.anthropic.com"}
+    junk_no_usage = {"status": 200, "model": "claude-opus-4-7", "upstream": "api.anthropic.com"}
     junk_no_quota = {
+        "status": 200,
         "model": "claude-opus-4-7",
         "upstream": "api.anthropic.com",
         "usage": {"cache_creation_1h_input_tokens": 10},
@@ -122,7 +123,21 @@ def test_non_measurement_rows_are_skipped_not_aborted():
     result = estimate_rows(rows, window="5h")
     assert result.status == "estimated"
     assert result.interval is not None
-    assert result.excluded_events >= 2
+    assert {e.reason for e in result.exclusions} >= {"missing_usage", "missing_quota"}
+
+
+def test_errored_requests_are_not_counted():
+    # A non-200 response that still carries usage must never enter the total.
+    # Placed between two crossings so that, if its cost were counted, it would
+    # shift the per-tick estimate far from the true $2.00/tick.
+    bad = event(10_000_000, 11)  # ~$100 of cache-write if it were counted
+    bad["status"] = 500
+    rows = [event(1, 10), event(200_000, 11), bad, event(200_000, 12)]
+    result = estimate_rows(rows, window="5h")
+    assert result.status == "estimated"
+    assert result.interval is not None
+    assert result.interval.mid == 2.0
+    assert any(e.reason == "request_not_served" for e in result.exclusions)
 
 
 def test_organization_does_not_gate_measurement():

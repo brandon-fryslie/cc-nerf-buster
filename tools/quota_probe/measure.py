@@ -21,6 +21,13 @@ from tools.quota_probe.estimator import Estimate, estimate_usage_log
 
 DEFAULT_MODEL = "claude-opus-4-7"
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 180
+# A probe that pushes utilization toward the limit is the workload most likely to
+# be throttled, so transient failures are expected. Retry a call a few times,
+# then skip the iteration; only give up entirely after many iterations in a row
+# fail (the run genuinely cannot make progress).
+MAX_CALL_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 2.0
+MAX_CONSECUTIVE_FAILURES = 5
 DEFAULT_TICK_USD = {
     "5h": 2.75,
     "7d": 14.0,
@@ -117,7 +124,10 @@ def claude_env(run_dir: Path) -> dict[str, str]:
     return env
 
 
-def run_claude(prompt: str, *, cfg: DriveConfig, iter_num: int) -> None:
+def run_claude(prompt: str, *, cfg: DriveConfig, iter_num: int, attempt: int) -> bool:
+    # [LAW:no-silent-failure] Every attempt is recorded and a failure is reported
+    # on stderr; the return value carries the outcome so the caller decides
+    # whether to retry. A transient failure must never abort the whole run.
     run_dir = cfg.run_dir
     prompt_path = run_dir / "prompts" / f"{iter_num:03d}.txt"
     output_path = run_dir / "outputs" / f"{iter_num:03d}.txt"
@@ -146,29 +156,64 @@ def run_claude(prompt: str, *, cfg: DriveConfig, iter_num: int) -> None:
         )
     except subprocess.TimeoutExpired as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        output_path.write_text(stdout + stderr)
+        output_path.write_text((exc.stdout or "") + (exc.stderr or ""))
         append_jsonl(run_dir / "driver-iterations.jsonl", {
             "iter": iter_num,
+            "attempt": attempt,
             "ts": utc_now(),
             "prompt_chars": len(prompt),
             "duration_ms": elapsed_ms,
             "timed_out": True,
+            "ok": False,
             "output_path": str(output_path),
         })
-        die(f"claude iter {iter_num} timed out after {cfg.claude_timeout_seconds}s; see {output_path}")
+        print(
+            f"warning: claude iter {iter_num} attempt {attempt} timed out after "
+            f"{cfg.claude_timeout_seconds}s; see {output_path}",
+            file=sys.stderr,
+        )
+        return False
     elapsed_ms = int((time.monotonic() - started) * 1000)
     output_path.write_text(completed.stdout + completed.stderr)
-    if completed.returncode != 0:
-        die(f"claude iter {iter_num} exited {completed.returncode}; see {output_path}")
+    ok = completed.returncode == 0
     append_jsonl(run_dir / "driver-iterations.jsonl", {
         "iter": iter_num,
+        "attempt": attempt,
         "ts": utc_now(),
         "prompt_chars": len(prompt),
         "duration_ms": elapsed_ms,
+        "exit_code": completed.returncode,
+        "ok": ok,
         "output_path": str(output_path),
     })
+    if not ok:
+        print(
+            f"warning: claude iter {iter_num} attempt {attempt} exited "
+            f"{completed.returncode}; see {output_path}",
+            file=sys.stderr,
+        )
+    return ok
+
+
+def attempt_claude_call(prompt: str, *, cfg: DriveConfig, iter_num: int, usage_path: Path) -> bool:
+    # Bounded retry with backoff. Returns True once a call succeeds AND its served
+    # usage event lands in the log. A failed attempt's traffic is still logged by
+    # the proxy as non-200 and is excluded from the total downstream, so retrying
+    # never double-counts. [LAW:no-ambient-temporal-coupling] the backoff schedule
+    # is owned here, not assumed elsewhere.
+    for attempt in range(MAX_CALL_ATTEMPTS):
+        before = usage_log_len(usage_path)
+        if run_claude(prompt, cfg=cfg, iter_num=iter_num, attempt=attempt):
+            if wait_for_usage_event(usage_path, before):
+                return True
+            print(
+                f"warning: claude iter {iter_num} attempt {attempt} succeeded but "
+                "no usage event landed; retrying",
+                file=sys.stderr,
+            )
+        if attempt + 1 < MAX_CALL_ATTEMPTS:
+            time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt))
+    return False
 
 
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -183,13 +228,13 @@ def usage_log_len(path: Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
-def wait_for_usage_event(path: Path, previous_len: int) -> None:
+def wait_for_usage_event(path: Path, previous_len: int) -> bool:
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         if usage_log_len(path) > previous_len:
-            return
+            return True
         time.sleep(0.1)
-    die(f"usage log did not receive a new event within 10s: {path}")
+    return False
 
 
 def synthetic_usage_tokens(cost_usd: float) -> int:
@@ -327,17 +372,16 @@ def drive(cfg: DriveConfig) -> Estimate:
             iter_num=0,
         )
     else:
-        before = usage_log_len(usage_path)
-        run_claude("Reply with exactly: ok", cfg=cfg, iter_num=0)
-        wait_for_usage_event(usage_path, before)
+        if not attempt_claude_call("Reply with exactly: ok", cfg=cfg, iter_num=0, usage_path=usage_path):
+            die("initial claude call failed after retries; cannot start measurement")
 
     estimate = estimate_run(cfg.run_dir, cfg.window)
     if not cfg.dry_run:
         reject_unusable_active_events(estimate)
+    consecutive_failures = 0
     for iter_num in range(1, cfg.max_iters + 1):
         prompt_chars = prompt_chars_for_estimate(estimate, usd_per_char)
         prompt = build_prompt(prompt_chars)
-        before_len = usage_log_len(usage_path)
         if cfg.dry_run:
             target_cost = max(0.02, min(DEFAULT_TICK_USD[cfg.window] * 0.35, prompt_chars * usd_per_char))
             (cfg.run_dir / "prompts" / f"{iter_num:03d}.txt").write_text(prompt)
@@ -350,8 +394,20 @@ def drive(cfg: DriveConfig) -> Estimate:
                 iter_num=iter_num,
             )
         else:
-            run_claude(prompt, cfg=cfg, iter_num=iter_num)
-            wait_for_usage_event(usage_path, before_len)
+            if not attempt_claude_call(prompt, cfg=cfg, iter_num=iter_num, usage_path=usage_path):
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    die(
+                        f"claude failed {consecutive_failures} iterations in a row after "
+                        "retries; cannot make progress"
+                    )
+                print(
+                    f"warning: iter {iter_num} failed after retries; skipping "
+                    f"(consecutive failures: {consecutive_failures})",
+                    file=sys.stderr,
+                )
+                continue
+            consecutive_failures = 0
         estimate = estimate_run(cfg.run_dir, cfg.window)
         if not cfg.dry_run:
             reject_unusable_active_events(estimate)

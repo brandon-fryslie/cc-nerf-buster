@@ -236,6 +236,17 @@ def build_observations(
     observations: list[Observation] = []
     exclusions: list[Exclusion] = []
     for line_num, row in enumerate(rows, 1):
+        # [FRAMING:representation] The cost total represents quota actually
+        # consumed, so only requests Anthropic served count. A non-200 response,
+        # or one the proxy flagged as errored (incomplete stream, etc.), is not a
+        # trustworthy measurement point: its tokens never enter the total.
+        if row.get("status") != 200:
+            exclusions.append(Exclusion(line_num, "request_not_served", str(row.get("status"))))
+            continue
+        errors = row.get("errors")
+        if isinstance(errors, list) and errors:
+            exclusions.append(Exclusion(line_num, "request_errored", ",".join(str(e) for e in errors)))
+            continue
         model = row.get("model")
         if not isinstance(model, str) or not model:
             exclusions.append(Exclusion(line_num, "missing_model"))
