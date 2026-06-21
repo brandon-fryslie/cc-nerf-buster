@@ -22,15 +22,6 @@ WINDOW_UTIL_FIELD = {
 
 
 @dataclass(frozen=True)
-class Scope:
-    org: str
-    upstream: str
-
-    def to_json(self) -> dict[str, str]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
 class Interval:
     lo: float
     hi: float
@@ -135,7 +126,6 @@ class Estimate:
     status: str
     reason: str
     window: str
-    scope: Scope | None
     loaded_events: int
     priced_events: int
     excluded_events: int
@@ -160,7 +150,6 @@ class Estimate:
             "status": self.status,
             "reason": self.reason,
             "window": self.window,
-            "scope": None if self.scope is None else self.scope.to_json(),
             "events": {
                 "loaded": self.loaded_events,
                 "priced": self.priced_events,
@@ -201,25 +190,6 @@ def load_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[Exclusion]]:
     return rows, exclusions
 
 
-def event_scope(row: dict[str, Any]) -> Scope:
-    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-    return Scope(
-        org=str(meta.get("organization_id") or ""),
-        upstream=str(row.get("upstream") or ""),
-    )
-
-
-def infer_scope(rows: list[dict[str, Any]], requested: Scope | None) -> tuple[Scope | None, str]:
-    if requested is not None:
-        return requested, ""
-    scopes = sorted({event_scope(row) for row in rows}, key=lambda s: (s.org, s.upstream))
-    if len(scopes) == 1:
-        return scopes[0], ""
-    if not scopes:
-        return None, "no_events"
-    return None, "scope_required"
-
-
 def request_cost_usd(model: str, usage: dict[str, Any]) -> float | None:
     pricing = MODEL_PRICING.get(model.strip())
     if pricing is None:
@@ -257,14 +227,25 @@ def build_observations(
     rows: list[dict[str, Any]],
     *,
     window: str,
-    scope: Scope,
 ) -> tuple[list[Observation], list[Exclusion]]:
+    # [LAW:one-source-of-truth] The run's usage log, produced by a proxy only the
+    # probe used, is the single dataset. A row is a measurement point when it
+    # carries a window utilization reading and a priceable cost; every other row
+    # is recorded as an exclusion and skipped, never a reason to abort.
     util_field = WINDOW_UTIL_FIELD[window]
     observations: list[Observation] = []
     exclusions: list[Exclusion] = []
     for line_num, row in enumerate(rows, 1):
-        if event_scope(row) != scope:
-            exclusions.append(Exclusion(line_num, "scope_mismatch"))
+        # [FRAMING:representation] The cost total represents quota actually
+        # consumed, so only requests Anthropic served count. A non-200 response,
+        # or one the proxy flagged as errored (incomplete stream, etc.), is not a
+        # trustworthy measurement point: its tokens never enter the total.
+        if row.get("status") != 200:
+            exclusions.append(Exclusion(line_num, "request_not_served", str(row.get("status"))))
+            continue
+        errors = row.get("errors")
+        if isinstance(errors, list) and errors:
+            exclusions.append(Exclusion(line_num, "request_errored", ",".join(str(e) for e in errors)))
             continue
         model = row.get("model")
         if not isinstance(model, str) or not model:
@@ -312,8 +293,6 @@ def build_crossings(observations: list[Observation]) -> tuple[list[Crossing], fl
         cost_before = measured_cost
         measured_cost += obs.cost_usd
         cost_after = measured_cost
-        if obs.bucket < previous_bucket:
-            return crossings, measured_cost, "utilization_reset"
         if obs.bucket > previous_bucket:
             crossed = obs.bucket - previous_bucket
             group = obs.line if crossed > 1 else 0
@@ -359,47 +338,14 @@ def estimate_rows(
     rows: list[dict[str, Any]],
     *,
     window: str,
-    scope: Scope | None = None,
     parse_exclusions: list[Exclusion] | None = None,
 ) -> Estimate:
     if window not in WINDOW_UTIL_FIELD:
         raise ValueError(f"unsupported window {window!r}")
-    selected_scope, scope_reason = infer_scope(rows, scope)
     base_exclusions = list(parse_exclusions or [])
-    if selected_scope is None:
-        return Estimate(
-            schema_version=1,
-            status="insufficient",
-            reason=scope_reason,
-            window=window,
-            scope=None,
-            loaded_events=len(rows),
-            priced_events=0,
-            excluded_events=len(base_exclusions),
-            measured_cost_usd=0.0,
-            crossings=[],
-            interval=None,
-            exclusions=base_exclusions,
-        )
-
-    observations, row_exclusions = build_observations(rows, window=window, scope=selected_scope)
+    observations, row_exclusions = build_observations(rows, window=window)
     exclusions = base_exclusions + row_exclusions
     crossings, measured_cost, crossing_reason = build_crossings(observations)
-    if crossing_reason == "utilization_reset":
-        return Estimate(
-            schema_version=1,
-            status="contaminated",
-            reason=crossing_reason,
-            window=window,
-            scope=selected_scope,
-            loaded_events=len(rows),
-            priced_events=len(observations),
-            excluded_events=len(exclusions),
-            measured_cost_usd=measured_cost,
-            crossings=crossings,
-            interval=None,
-            exclusions=exclusions,
-        )
     interval, estimate_reason = estimate_interval(crossings)
     status = "estimated" if interval is not None else "insufficient"
     reason = "" if interval is not None else (estimate_reason or crossing_reason)
@@ -408,7 +354,6 @@ def estimate_rows(
         status=status,
         reason=reason,
         window=window,
-        scope=selected_scope,
         loaded_events=len(rows),
         priced_events=len(observations),
         excluded_events=len(exclusions),
@@ -419,7 +364,7 @@ def estimate_rows(
     )
 
 
-def estimate_usage_log(path: Path, *, window: str, scope: Scope | None = None) -> Estimate:
+def estimate_usage_log(path: Path, *, window: str) -> Estimate:
     rows, parse_exclusions = load_jsonl(path)
-    return estimate_rows(rows, window=window, scope=scope, parse_exclusions=parse_exclusions)
+    return estimate_rows(rows, window=window, parse_exclusions=parse_exclusions)
 

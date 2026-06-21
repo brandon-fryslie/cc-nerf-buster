@@ -3,20 +3,16 @@ from __future__ import annotations
 
 from tools.quota_probe.estimator import (
     Crossing,
-    Scope,
     estimate_interval,
     estimate_rows,
     request_cost_usd,
 )
 
 
-SCOPE = Scope(org="org_1", upstream="api.anthropic.com")
-
-
 def event(line_cost_tokens: int, util_bucket: int, *, model: str = "claude-opus-4-7") -> dict:
     return {
         "ts": "2026-06-16T00:00:00Z",
-        "upstream": SCOPE.upstream,
+        "upstream": "api.anthropic.com",
         "model": model,
         "status": 200,
         "duration_ms": 10,
@@ -33,7 +29,7 @@ def event(line_cost_tokens: int, util_bucket: int, *, model: str = "claude-opus-
             "five_hour_utilization": util_bucket / 100.0,
             "seven_day_utilization": util_bucket / 100.0,
         },
-        "meta": {"organization_id": SCOPE.org, "request_id": f"req_{util_bucket}"},
+        "meta": {"organization_id": "org_1", "request_id": f"req_{util_bucket}"},
     }
 
 
@@ -112,25 +108,44 @@ def test_multi_tick_event_pairs_with_later_crossing():
     assert interval.hi == 4.0
 
 
-def test_utilization_reset_marks_run_contaminated():
-    rows = [event(1, 80), event(10_000, 81), event(10_000, 10)]
+def test_non_measurement_rows_are_skipped_not_aborted():
+    # The dedicated proxy logs every request, including ones with no usage or no
+    # quota headers (errors, non-message calls). These must be excluded and the
+    # run must still produce an estimate from the real measurement points.
+    junk_no_usage = {"status": 200, "model": "claude-opus-4-7", "upstream": "api.anthropic.com"}
+    junk_no_quota = {
+        "status": 200,
+        "model": "claude-opus-4-7",
+        "upstream": "api.anthropic.com",
+        "usage": {"cache_creation_1h_input_tokens": 10},
+    }
+    rows = [junk_no_usage, event(1, 10), event(200_000, 11), junk_no_quota, event(200_000, 12)]
     result = estimate_rows(rows, window="5h")
-    assert result.status == "contaminated"
-    assert result.reason == "utilization_reset"
-
-
-def test_multiple_scopes_require_explicit_scope():
-    other = event(100, 11)
-    other["meta"] = {"organization_id": "org_2"}
-    result = estimate_rows([event(1, 10), other], window="5h")
-    assert result.status == "insufficient"
-    assert result.reason == "scope_required"
-
-
-def test_explicit_scope_filters_other_scopes():
-    other = event(100, 11)
-    other["meta"] = {"organization_id": "org_2"}
-    rows = [event(1, 10), event(200_000, 11), event(200_000, 12), other]
-    result = estimate_rows(rows, window="5h", scope=SCOPE)
     assert result.status == "estimated"
-    assert any(e.reason == "scope_mismatch" for e in result.exclusions)
+    assert result.interval is not None
+    assert {e.reason for e in result.exclusions} >= {"missing_usage", "missing_quota"}
+
+
+def test_errored_requests_are_not_counted():
+    # A non-200 response that still carries usage must never enter the total.
+    # Placed between two crossings so that, if its cost were counted, it would
+    # shift the per-tick estimate far from the true $2.00/tick.
+    bad = event(10_000_000, 11)  # ~$100 of cache-write if it were counted
+    bad["status"] = 500
+    rows = [event(1, 10), event(200_000, 11), bad, event(200_000, 12)]
+    result = estimate_rows(rows, window="5h")
+    assert result.status == "estimated"
+    assert result.interval is not None
+    assert result.interval.mid == 2.0
+    assert any(e.reason == "request_not_served" for e in result.exclusions)
+
+
+def test_organization_does_not_gate_measurement():
+    # Org/upstream no longer participate in measurement: a row whose meta differs
+    # is just another event, consumed if it carries the data the calc needs.
+    other = event(200_000, 11)
+    other["meta"] = {"organization_id": "org_2"}
+    rows = [event(1, 10), other, event(200_000, 12)]
+    result = estimate_rows(rows, window="5h")
+    assert result.status == "estimated"
+    assert result.interval is not None
