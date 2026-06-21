@@ -41,6 +41,57 @@ def test_dry_run_drive_writes_replayable_artifacts(tmp_path):
     assert saved["weighted_usd_per_tick"]["relative_width"] <= 0.20
 
 
+def test_build_prompt_emits_whole_blocks():
+    # Stage A contract: the prompt is the header plus exactly `blocks` fixed paragraphs,
+    # never truncated — that is what makes input_tokens a deterministic line in blocks.
+    assert measure.build_prompt(0).count(measure.PROMPT_PARAGRAPH) == 0
+    assert measure.build_prompt(3).count(measure.PROMPT_PARAGRAPH) == 3
+    assert measure.PROMPT_HEADER in measure.build_prompt(2)
+
+
+def test_fit_block_line_recovers_constants():
+    a_true, b_true = 25.0, 72.0
+    samples = [(k, int(a_true + k * b_true)) for k in (0, 10, 250)]
+    a, b = measure.fit_block_line(samples)
+    assert abs(b - b_true) < 0.5
+    assert abs(a - a_true) < 1.0
+    # one point cannot separate intercept from slope
+    assert measure.fit_block_line([(5, 360)]) is None
+
+
+def test_token_actuator_converges_and_tracks(tmp_path):
+    cfg = DriveConfig(
+        window="5h",
+        run_dir=tmp_path,
+        model="claude-opus-4-7",
+        target_relative_width=0.005,
+        max_iters=60,
+        dry_run=True,
+    )
+    drive(cfg)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "driver-iterations.jsonl").read_text().splitlines()
+        if line.strip() and "tokens_per_block" in line
+    ]
+    assert rows, "no calibration rows were logged"
+
+    # Stage A converged to the synthetic's TRUE block size (72), which differs from the
+    # actuator seed (57). A pass therefore proves the closed loop, not shared constants.
+    assert abs(rows[-1]["tokens_per_block"] - measure.DRYRUN_TRUE_TOKENS_PER_BLOCK) < 0.5
+    assert measure.DEFAULT_TOKENS_PER_BLOCK != measure.DRYRUN_TRUE_TOKENS_PER_BLOCK
+
+    # Post-bootstrap, the prompt the actuator builds lands on its input-token target.
+    for r in rows[2:]:
+        assert abs(r["observed_input_tokens"] - r["input_tokens_target"]) <= 80
+
+    # The estimate's interval tightens as crossings accumulate.
+    widths = [r["relative_width"] for r in rows if r["relative_width"] is not None]
+    assert len(widths) >= 2
+    assert widths[-1] < widths[0]
+    assert widths[-1] <= 0.10
+
+
 def test_active_run_rejects_unusable_events():
     estimate = Estimate(
         schema_version=1,
