@@ -2,7 +2,7 @@
 """Tests for the Crossing/Interval seam in crossings.py.
 
 Run with:
-    uv run --with pytest python -m pytest tools/capacity-probe/test_crossings.py -v
+    uv run --with pytest python -m pytest tools/capacity_probe/test_crossings.py -v
 """
 from __future__ import annotations
 

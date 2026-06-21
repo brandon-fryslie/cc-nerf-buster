@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-report.py — post-run analysis for capacity-probe.
+report.py — post-run analysis for capacity_probe.
 
 Reads snapshots.jsonl + iterations.jsonl + manifest.json from a run directory
 and produces:

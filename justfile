@@ -57,28 +57,28 @@ quota-report RUN_DIR WINDOW:
 #
 # Legacy capacity probe: 5h window.
 probe-5h *ARGS:
-    cd tools/capacity-probe && bash with-proxy.sh --window=5h {{ARGS}}
+    cd tools/capacity_probe && bash with-proxy.sh --window=5h {{ARGS}}
 
 # Legacy capacity probe: 7d window.
 probe-7d *ARGS:
-    cd tools/capacity-probe && bash with-proxy.sh --window=7d {{ARGS}}
+    cd tools/capacity_probe && bash with-proxy.sh --window=7d {{ARGS}}
 
 # Legacy capacity probe dry-run, 5h: exercises every code path with `echo` replacing `claude`.
 probe-dry-5h *ARGS:
-    cd tools/capacity-probe && bash with-proxy.sh --dry-run --window=5h {{ARGS}}
+    cd tools/capacity_probe && bash with-proxy.sh --dry-run --window=5h {{ARGS}}
 
 # Legacy capacity probe dry-run, 7d: exercises every code path with `echo` replacing `claude`.
 probe-dry-7d *ARGS:
-    cd tools/capacity-probe && bash with-proxy.sh --dry-run --window=7d {{ARGS}}
+    cd tools/capacity_probe && bash with-proxy.sh --dry-run --window=7d {{ARGS}}
 
-# Regenerate report.md from an existing capacity-probe run directory.
+# Regenerate report.md from an existing capacity_probe run directory.
 probe-report RUN_DIR:
-    python3 tools/capacity-probe/report.py {{RUN_DIR}}
+    python3 tools/capacity_probe/report.py {{RUN_DIR}}
 
 # Recompute and print low/mid/high quota bounds from an existing probe run.
 probe-bounds RUN_DIR:
-    python3 tools/capacity-probe/report.py --print-bounds {{RUN_DIR}}
+    python3 tools/capacity_probe/report.py --print-bounds {{RUN_DIR}}
 
 # Compute quota capacity from all observed traffic in usage.jsonl (no quota spent).
 passive-report *ARGS:
-    python3 tools/capacity-probe/passive-report.py {{ARGS}}
+    python3 tools/capacity_probe/passive-report.py {{ARGS}}

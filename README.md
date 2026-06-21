@@ -93,7 +93,7 @@ To install and run your own capacity probe, see [`USAGE.md`](USAGE.md).
 - `metrics.go` — Prometheus collector and quota-window bookkeeping.
 - `log.go` — canonical JSONL request log.
 - `tools/quota_probe/` — fresh event-sourced quota estimator and driver.
-- `tools/capacity-probe/` — legacy Python driver retained for comparison.
+- `tools/capacity_probe/` — legacy Python driver retained for comparison.
 - `AGENTS.md` — architectural constraints for contributors.
 
 ## License

@@ -35,7 +35,7 @@
   - Records per-request counters and quota utilization gauges.
   - Maintains cumulative weighted cost and rolling 5h/7d capacity estimates.
   - Persists estimator state to `quota_estimates.json` in `data-dir`.
-- `tools/capacity-probe` is an external calibration workflow:
+- `tools/capacity_probe` is an external calibration workflow:
   - `probe.sh` drives repeated `claude -p` calls and snapshots metrics.
   - `report.py` produces reproducible run reports from probe artifacts.
 
@@ -47,7 +47,7 @@
   - SSE responses are forwarded incrementally while parsing usage from event lines.
   - Non-streaming responses are buffered up to 10MB for usage extraction; larger payloads are still forwarded but usage extraction is skipped with an error code.
 - Model pricing must stay synchronized across files:
-  - `anthropic.go` (`modelPricing`) and `tools/capacity-probe/report.py` (`PRICING`) need matching ratios/values.
+  - `anthropic.go` (`modelPricing`) and `tools/capacity_probe/report.py` (`PRICING`) need matching ratios/values.
   - Unknown models intentionally increment `ccnb_no_model_error_*` counters and are treated as a probe-failure condition.
 - Metrics keying uses packed internal keys (`\x00` separators) for map indexes, while persisted estimate keys use `org/upstream` strings.
 - Throttled operational logging should go through `throttledLog(category, ...)` to avoid noisy repeated logs (60-second suppression window per category).
