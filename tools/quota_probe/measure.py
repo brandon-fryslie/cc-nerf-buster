@@ -410,7 +410,12 @@ def synthetic_event(*, input_tokens: int, util_bucket: int, model: str, request_
 
 def append_synthetic_event(run_dir: Path, *, cfg: DriveConfig, actual_spend: float, blocks: int, iter_num: int) -> float:
     input_tokens = synthetic_input_tokens(blocks)
-    cost_usd = request_cost_usd(cfg.model, {"input_tokens": input_tokens}) or 0.0
+    # seed_actuator already rejected unknown models, so None here is a broken invariant,
+    # not an expected input — surface it instead of coercing to a zero-cost event that
+    # would silently corrupt the estimate. [LAW:no-silent-failure]
+    cost_usd = request_cost_usd(cfg.model, {"input_tokens": input_tokens})
+    if cost_usd is None:
+        die(f"dry-run pricing returned no cost for model {cfg.model!r}; seed_actuator should have rejected it")
     tick_usd = DEFAULT_TICK_USD[cfg.window]
     new_spend = actual_spend + cost_usd
     util_bucket = min(100, int(new_spend / tick_usd))
