@@ -16,7 +16,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.quota_probe.estimator import Estimate, estimate_usage_log
+from tools.quota_probe.estimator import (
+    MODEL_PRICING,
+    Estimate,
+    estimate_usage_log,
+    number,
+    request_cost_usd,
+)
 
 
 DEFAULT_MODEL = "claude-opus-4-7"
@@ -32,14 +38,30 @@ DEFAULT_TICK_USD = {
     "5h": 2.75,
     "7d": 14.0,
 }
-DEFAULT_USD_PER_CHAR = 0.000003
-MIN_PROMPT_CHARS = 200
-MAX_PROMPT_CHARS = 250_000
+# The actuator steers prompt size in input tokens — the billed unit — not chars.
+# The prompt is PROMPT_HEADER followed by a whole number of fixed PROMPT_PARAGRAPH
+# blocks, so input_tokens = header_tokens + blocks * tokens_per_block is linear with
+# stable constants (fixed text tokenizes deterministically). These are only seeds;
+# both constants are refit from the input_tokens of served events. [LAW:one-source-of-truth]
+DEFAULT_HEADER_TOKENS = 16.0
+DEFAULT_TOKENS_PER_BLOCK = 57.0
+MIN_PROMPT_TOKENS = 64
+MAX_PROMPT_TOKENS = 64_000
+PROMPT_HEADER = "Read the operational note and reply with exactly: ok\n\n"
 PROMPT_PARAGRAPH = (
     "Operational measurement note. The request describes ordinary service "
     "activity, quota accounting, request logging, and stable capacity "
     "measurement. Reply with one short sentence confirming receipt."
 )
+
+# Dry-run only: the synthetic API uses true constants deliberately DIFFERENT from the
+# actuator seeds above, so a passing dry-run proves the calibration loop converged
+# rather than that the simulator was handed the actuator's own numbers. [LAW:behavior-not-structure]
+DRYRUN_TRUE_HEADER_TOKENS = 25.0
+DRYRUN_TRUE_TOKENS_PER_BLOCK = 72.0
+# Observed usd/block diverging from the no-cache price prediction by more than this
+# factor means cache-write tokens are inflating cost; surfaced, never silently absorbed.
+CACHE_WRITE_WARN_FACTOR = 1.5
 
 
 @dataclass(frozen=True)
@@ -77,22 +99,142 @@ def die(message: str) -> "NoReturn":
     raise SystemExit(1)
 
 
-def build_prompt(target_chars: int) -> str:
-    target = max(MIN_PROMPT_CHARS, min(MAX_PROMPT_CHARS, target_chars))
-    header = "Read the operational note and reply with exactly: ok\n\n"
-    parts = [header]
-    while len("".join(parts)) < target:
+@dataclass(frozen=True)
+class Actuator:
+    # The live model of how a prompt becomes cost, in two separately-calibrated stages:
+    #   header_tokens, tokens_per_block : prompt blocks -> input_tokens (Stage A, deterministic)
+    #   usd_per_block                   : prompt blocks -> priced cost  (Stage B, cache-robust)
+    # [LAW:one-source-of-truth] this is the single place the actuator's knowledge lives.
+    header_tokens: float
+    tokens_per_block: float
+    usd_per_block: float
+
+
+def model_input_price_per_token(model: str) -> float:
+    # [LAW:one-source-of-truth] prices come from the estimator's table, never duplicated here.
+    pricing = MODEL_PRICING.get(model.strip())
+    if pricing is None:
+        die(f"unknown model {model!r}: no pricing to seed the actuator")
+    return pricing.input_per_mtok / 1_000_000.0
+
+
+def seed_actuator(model: str) -> Actuator:
+    tokens_per_block = DEFAULT_TOKENS_PER_BLOCK
+    # Seed Stage B from the no-cache price law; this is a bootstrap value, not the
+    # actuation path — it is replaced by observed cost as soon as the estimate exists.
+    usd_per_block = tokens_per_block * model_input_price_per_token(model)
+    return Actuator(DEFAULT_HEADER_TOKENS, tokens_per_block, usd_per_block)
+
+
+def build_prompt(blocks: int) -> str:
+    # Whole blocks only — a partial/truncated block would break the deterministic
+    # tokenization the calibration depends on. [LAW:types-are-the-program] the block is the unit.
+    parts = [PROMPT_HEADER]
+    for _ in range(max(0, blocks)):
         parts.append(PROMPT_PARAGRAPH)
         parts.append("\n\n")
-    return "".join(parts)[:target] + "\n"
+    return "".join(parts) + "\n"
 
 
-def prompt_chars_for_estimate(estimate: Estimate, usd_per_char: float) -> int:
+def blocks_for_target_tokens(target_input_tokens: int, actuator: Actuator) -> int:
+    target = max(MIN_PROMPT_TOKENS, min(MAX_PROMPT_TOKENS, target_input_tokens))
+    need = (target - actuator.header_tokens) / max(actuator.tokens_per_block, 1e-9)
+    return max(0, round(need))
+
+
+def target_input_tokens_for_estimate(estimate: Estimate, actuator: Actuator) -> int:
+    # The steering policy stays a USD fraction of a tick (a sub-tick step keeps overshoot
+    # small); only the final conversion changes — USD -> blocks via observed usd_per_block,
+    # blocks -> input_tokens via the Stage A line. [LAW:dataflow-not-control-flow]
     tick = DEFAULT_TICK_USD[estimate.window]
     target_usd = tick * 0.10
     if estimate.interval is not None:
         target_usd = max(0.02, min(estimate.interval.mid * 0.20, max(estimate.interval.width / 2.0, estimate.interval.mid * 0.02)))
-    return int(target_usd / max(usd_per_char, 1e-9))
+    target_blocks = target_usd / max(actuator.usd_per_block, 1e-12)
+    return int(actuator.header_tokens + target_blocks * actuator.tokens_per_block)
+
+
+def fit_block_line(samples: list[tuple[int, int]]) -> tuple[float, float] | None:
+    # Least-squares fit of input_tokens = a + b*blocks. Needs >=2 distinct block counts;
+    # a single point cannot separate intercept from slope, so we hold the seed until then.
+    xs = {blocks for blocks, _ in samples}
+    if len(xs) < 2:
+        return None
+    n = len(samples)
+    sx = sum(b for b, _ in samples)
+    sy = sum(t for _, t in samples)
+    sxx = sum(b * b for b, _ in samples)
+    sxy = sum(b * t for b, t in samples)
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return None
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    if slope <= 0:
+        return None
+    return intercept, slope
+
+
+def recalibrate(
+    seed: Actuator,
+    samples: list[tuple[int, int]],
+    estimate: Estimate,
+    total_blocks: int,
+    model: str,
+) -> tuple[Actuator, str | None]:
+    # Pure: computes the actuator and, on cost divergence, the *text* of a warning — but
+    # never emits it. drive() prints at the effect boundary. [LAW:effects-at-boundaries]
+    fit = fit_block_line(samples)
+    header_tokens, tokens_per_block = fit if fit is not None else (seed.header_tokens, seed.tokens_per_block)
+    # Stage B: once the estimator has a cost interval, take usd/block from the priced
+    # cost it actually measured (absorbs cache-write/output weighting by construction).
+    # Otherwise hold the no-cache seed. Divergence from the prediction is reported, not hidden.
+    warning: str | None = None
+    if estimate.interval is not None and total_blocks > 0:
+        usd_per_block = estimate.measured_cost_usd / total_blocks
+        predicted = tokens_per_block * model_input_price_per_token(model)
+        if predicted > 0 and usd_per_block > predicted * CACHE_WRITE_WARN_FACTOR:
+            warning = (
+                f"observed usd/block {usd_per_block:.6g} exceeds the no-cache prediction "
+                f"{predicted:.6g} by >{CACHE_WRITE_WARN_FACTOR}x; cache-write tokens are "
+                "inflating cost"
+            )
+    else:
+        usd_per_block = tokens_per_block * model_input_price_per_token(model)
+    return Actuator(header_tokens, tokens_per_block, usd_per_block), warning
+
+
+def served_input_tokens_since(path: Path, before_len: int) -> int | None:
+    # Sum input_tokens over served (status-200) usage events appended after before_len.
+    # None when no served event landed, so the caller never records a phantom sample.
+    # before_len counts non-empty lines (see usage_log_len), so a corrupt line is kept as
+    # a placeholder to preserve that index alignment — skipping it would misalign the slice
+    # and silently drop a real later event. Its decode failure is surfaced, not absorbed.
+    # [LAW:no-silent-failure]
+    if not path.exists():
+        return None
+    rows: list[dict[str, Any]] = []
+    with path.open() as f:
+        for line_num, line in enumerate(f, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                rows.append(json.loads(stripped))
+            except json.JSONDecodeError as exc:
+                print(f"warning: unparseable usage log line {line_num}: {exc}", file=sys.stderr)
+                rows.append({})
+    served_total = 0
+    found = False
+    for row in rows[before_len:]:
+        if not isinstance(row, dict) or row.get("status") != 200:
+            continue
+        usage = row.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        served_total += int(number(usage.get("input_tokens")))
+        found = True
+    return served_total if found else None
 
 
 def claude_env(run_dir: Path) -> dict[str, str]:
@@ -132,6 +274,10 @@ def run_claude(prompt: str, *, cfg: DriveConfig, iter_num: int, attempt: int) ->
     prompt_path = run_dir / "prompts" / f"{iter_num:03d}.txt"
     output_path = run_dir / "outputs" / f"{iter_num:03d}.txt"
     prompt_path.write_text(prompt)
+    # These flags are load-bearing for the cost model: empty system prompt + no session
+    # persistence + no tools keep each call a fresh, cache-free request whose cost is
+    # dominated by the input tokens the actuator controls. Changing them can reintroduce
+    # cache-write billing that the Stage-B observed-cost calibration would then have to absorb.
     cmd = [
         "claude",
         "-p",
@@ -237,12 +383,13 @@ def wait_for_usage_event(path: Path, previous_len: int) -> bool:
     return False
 
 
-def synthetic_usage_tokens(cost_usd: float) -> int:
-    return max(1, int(round(cost_usd * 1_000_000.0 / 10.0)))
+def synthetic_input_tokens(blocks: int) -> int:
+    return max(1, int(round(DRYRUN_TRUE_HEADER_TOKENS + blocks * DRYRUN_TRUE_TOKENS_PER_BLOCK)))
 
 
-def synthetic_event(*, cost_usd: float, util_bucket: int, model: str, request_id: str) -> dict[str, Any]:
-    tokens = synthetic_usage_tokens(cost_usd)
+def synthetic_event(*, input_tokens: int, util_bucket: int, model: str, request_id: str) -> dict[str, Any]:
+    # Fresh-call model: cost lives in input tokens (no cache), so the estimator prices it
+    # through the 1.0x input weight and the token actuator is genuinely exercised.
     return {
         "ts": utc_now(),
         "upstream": "api.anthropic.com",
@@ -252,10 +399,10 @@ def synthetic_event(*, cost_usd: float, util_bucket: int, model: str, request_id
         "streaming": False,
         "errors": [],
         "usage": {
-            "input_tokens": 0,
+            "input_tokens": input_tokens,
             "output_tokens": 0,
-            "cache_creation_input_tokens": tokens,
-            "cache_creation_1h_input_tokens": tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_creation_1h_input_tokens": 0,
             "cache_read_input_tokens": 0,
         },
         "quota": {
@@ -269,14 +416,21 @@ def synthetic_event(*, cost_usd: float, util_bucket: int, model: str, request_id
     }
 
 
-def append_synthetic_event(run_dir: Path, *, cfg: DriveConfig, actual_spend: float, cost_usd: float, iter_num: int) -> float:
+def append_synthetic_event(run_dir: Path, *, cfg: DriveConfig, actual_spend: float, blocks: int, iter_num: int) -> float:
+    input_tokens = synthetic_input_tokens(blocks)
+    # seed_actuator already rejected unknown models, so None here is a broken invariant,
+    # not an expected input — surface it instead of coercing to a zero-cost event that
+    # would silently corrupt the estimate. [LAW:no-silent-failure]
+    cost_usd = request_cost_usd(cfg.model, {"input_tokens": input_tokens})
+    if cost_usd is None:
+        die(f"dry-run pricing returned no cost for model {cfg.model!r}; seed_actuator should have rejected it")
     tick_usd = DEFAULT_TICK_USD[cfg.window]
     new_spend = actual_spend + cost_usd
     util_bucket = min(100, int(new_spend / tick_usd))
     append_jsonl(
         run_dir / "usage.jsonl",
         synthetic_event(
-            cost_usd=cost_usd,
+            input_tokens=input_tokens,
             util_bucket=util_bucket,
             model=cfg.model,
             request_id=f"dry_{iter_num:03d}",
@@ -360,39 +514,43 @@ def drive(cfg: DriveConfig) -> Estimate:
     write_manifest(cfg.run_dir, cfg)
 
     usage_path = cfg.run_dir / "usage.jsonl"
-    usd_per_char = DEFAULT_USD_PER_CHAR
+    seed = seed_actuator(cfg.model)
+    actuator = seed
+    # Served-iter samples (blocks emitted, observed input_tokens) drive Stage A; total_blocks
+    # over served iters drives Stage B. Both come from served events only — never from prompt
+    # files on disk, which would include skipped/failed iters. [LAW:one-source-of-truth]
+    samples: list[tuple[int, int]] = []
+    total_blocks = 0
     dry_spend = DEFAULT_TICK_USD[cfg.window] * 23.37
 
+    # Warmup at blocks=0: a served event at the Stage-A intercept, anchoring header_tokens.
+    before = usage_log_len(usage_path)
     if cfg.dry_run:
-        dry_spend = append_synthetic_event(
-            cfg.run_dir,
-            cfg=cfg,
-            actual_spend=dry_spend,
-            cost_usd=0.001,
-            iter_num=0,
-        )
+        dry_spend = append_synthetic_event(cfg.run_dir, cfg=cfg, actual_spend=dry_spend, blocks=0, iter_num=0)
     else:
-        if not attempt_claude_call("Reply with exactly: ok", cfg=cfg, iter_num=0, usage_path=usage_path):
+        if not attempt_claude_call(build_prompt(0), cfg=cfg, iter_num=0, usage_path=usage_path):
             die("initial claude call failed after retries; cannot start measurement")
+    observed = served_input_tokens_since(usage_path, before)
+    if observed is not None:
+        samples.append((0, observed))
 
     estimate = estimate_run(cfg.run_dir, cfg.window)
     if not cfg.dry_run:
         reject_unusable_active_events(estimate)
+    actuator, warning = recalibrate(seed, samples, estimate, total_blocks, cfg.model)
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+
     consecutive_failures = 0
     for iter_num in range(1, cfg.max_iters + 1):
-        prompt_chars = prompt_chars_for_estimate(estimate, usd_per_char)
-        prompt = build_prompt(prompt_chars)
+        target_tokens = target_input_tokens_for_estimate(estimate, actuator)
+        blocks = blocks_for_target_tokens(target_tokens, actuator)
+        prompt = build_prompt(blocks)
+        before = usage_log_len(usage_path)
         if cfg.dry_run:
-            target_cost = max(0.02, min(DEFAULT_TICK_USD[cfg.window] * 0.35, prompt_chars * usd_per_char))
             (cfg.run_dir / "prompts" / f"{iter_num:03d}.txt").write_text(prompt)
             (cfg.run_dir / "outputs" / f"{iter_num:03d}.txt").write_text("ok\n")
-            dry_spend = append_synthetic_event(
-                cfg.run_dir,
-                cfg=cfg,
-                actual_spend=dry_spend,
-                cost_usd=target_cost,
-                iter_num=iter_num,
-            )
+            dry_spend = append_synthetic_event(cfg.run_dir, cfg=cfg, actual_spend=dry_spend, blocks=blocks, iter_num=iter_num)
         else:
             if not attempt_claude_call(prompt, cfg=cfg, iter_num=iter_num, usage_path=usage_path):
                 consecutive_failures += 1
@@ -408,21 +566,29 @@ def drive(cfg: DriveConfig) -> Estimate:
                 )
                 continue
             consecutive_failures = 0
+        observed = served_input_tokens_since(usage_path, before)
+        if observed is not None:
+            samples.append((blocks, observed))
+            total_blocks += blocks
         estimate = estimate_run(cfg.run_dir, cfg.window)
         if not cfg.dry_run:
             reject_unusable_active_events(estimate)
-        if estimate.interval is not None:
-            usd_per_char = max(1e-9, estimate.measured_cost_usd / max(1, sum_prompt_chars(cfg.run_dir)))
-            if estimate.interval.relative_width <= cfg.target_relative_width:
-                return estimate
+        actuator, warning = recalibrate(seed, samples, estimate, total_blocks, cfg.model)
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
+        append_jsonl(cfg.run_dir / "driver-iterations.jsonl", {
+            "iter": iter_num,
+            "ts": utc_now(),
+            "input_tokens_target": target_tokens,
+            "blocks": blocks,
+            "observed_input_tokens": observed,
+            "tokens_per_block": actuator.tokens_per_block,
+            "usd_per_block": actuator.usd_per_block,
+            "relative_width": None if estimate.interval is None else estimate.interval.relative_width,
+        })
+        if estimate.interval is not None and estimate.interval.relative_width <= cfg.target_relative_width:
+            return estimate
     return estimate
-
-
-def sum_prompt_chars(run_dir: Path) -> int:
-    total = 0
-    for path in (run_dir / "prompts").glob("*.txt"):
-        total += len(path.read_text())
-    return total
 
 
 def parse_args() -> argparse.Namespace:
