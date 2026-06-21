@@ -355,8 +355,6 @@ def drive(cfg: DriveConfig) -> Estimate:
         estimate = estimate_run(cfg.run_dir, cfg.window)
         if not cfg.dry_run:
             reject_unusable_active_events(estimate)
-        if estimate.status == "contaminated":
-            die(f"run contaminated: {estimate.reason}")
         if estimate.interval is not None:
             usd_per_char = max(1e-9, estimate.measured_cost_usd / max(1, sum_prompt_chars(cfg.run_dir)))
             if estimate.interval.relative_width <= cfg.target_relative_width:

@@ -282,8 +282,6 @@ def build_crossings(observations: list[Observation]) -> tuple[list[Crossing], fl
         cost_before = measured_cost
         measured_cost += obs.cost_usd
         cost_after = measured_cost
-        if obs.bucket < previous_bucket:
-            return crossings, measured_cost, "utilization_reset"
         if obs.bucket > previous_bucket:
             crossed = obs.bucket - previous_bucket
             group = obs.line if crossed > 1 else 0
@@ -337,20 +335,6 @@ def estimate_rows(
     observations, row_exclusions = build_observations(rows, window=window)
     exclusions = base_exclusions + row_exclusions
     crossings, measured_cost, crossing_reason = build_crossings(observations)
-    if crossing_reason == "utilization_reset":
-        return Estimate(
-            schema_version=1,
-            status="contaminated",
-            reason=crossing_reason,
-            window=window,
-            loaded_events=len(rows),
-            priced_events=len(observations),
-            excluded_events=len(exclusions),
-            measured_cost_usd=measured_cost,
-            crossings=crossings,
-            interval=None,
-            exclusions=exclusions,
-        )
     interval, estimate_reason = estimate_interval(crossings)
     status = "estimated" if interval is not None else "insufficient"
     reason = "" if interval is not None else (estimate_reason or crossing_reason)

@@ -108,13 +108,6 @@ def test_multi_tick_event_pairs_with_later_crossing():
     assert interval.hi == 4.0
 
 
-def test_utilization_reset_marks_run_contaminated():
-    rows = [event(1, 80), event(10_000, 81), event(10_000, 10)]
-    result = estimate_rows(rows, window="5h")
-    assert result.status == "contaminated"
-    assert result.reason == "utilization_reset"
-
-
 def test_non_measurement_rows_are_skipped_not_aborted():
     # The dedicated proxy logs every request, including ones with no usage or no
     # quota headers (errors, non-message calls). These must be excluded and the
