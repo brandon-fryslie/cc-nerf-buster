@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from tools.quota_probe.estimator import (
     MODEL_PRICING,
     Estimate,
+    Interval,
     estimate_usage_log,
     number,
     request_cost_usd,
@@ -47,6 +48,13 @@ DEFAULT_HEADER_TOKENS = 16.0
 DEFAULT_TOKENS_PER_BLOCK = 57.0
 MIN_PROMPT_TOKENS = 64
 MAX_PROMPT_TOKENS = 64_000
+# Fraction of the predicted-boundary lower edge a bulk step aims for, so the
+# expected landing falls *before* the boundary and a single jump cannot blow past
+# it into a bulk-wide crossing bracket. Token actuation (.5) removed char->cost
+# slippage, so the only residual overshoot is output/cache noise — a tight
+# undershoot is safe. [LAW:no-silent-failure] an overshoot is still recorded as a
+# wide crossing, never discarded.
+BULK_UNDERSHOOT = 0.9
 PROMPT_HEADER = "Read the operational note and reply with exactly: ok\n\n"
 PROMPT_PARAGRAPH = (
     "Operational measurement note. The request describes ordinary service "
@@ -142,16 +150,45 @@ def blocks_for_target_tokens(target_input_tokens: int, actuator: Actuator) -> in
     return max(0, round(need))
 
 
+def boundary_window(estimate: Estimate, prior_tick: float) -> Interval:
+    # The cumulative-cost band the *next* integer util boundary (k_last + 1) falls in.
+    # Anchored on the most recent Crossing (which brackets Q0) plus one tick of C:
+    #     [cost_last_before + C_lo, cost_last_after + C_hi]
+    # C is the live interval when it exists, else the point prior as a degenerate band.
+    # Before any crossing Q0 is unbracketed, so the boundary is only known to lie within
+    # one C of now — a full-tick-wide window starting at now. That is the bootstrap: not a
+    # mode, just the window value when no anchor exists yet. [LAW:one-source-of-truth] C
+    # lives only in estimate.interval; the Q0 anchor is only the most recent crossing.
+    now = estimate.measured_cost_usd
+    if estimate.crossings:
+        anchor = estimate.crossings[-1]
+        c = estimate.interval or Interval(prior_tick, prior_tick)
+        return Interval(anchor.cost_before + c.lo, anchor.cost_after + c.hi)
+    return Interval(now, now + prior_tick)
+
+
 def target_input_tokens_for_estimate(estimate: Estimate, actuator: Actuator) -> int:
-    # The steering policy stays a USD fraction of a tick (a sub-tick step keeps overshoot
-    # small); only the final conversion changes — USD -> blocks via observed usd_per_block,
-    # blocks -> input_tokens via the Stage A line. [LAW:dataflow-not-control-flow]
-    tick = DEFAULT_TICK_USD[estimate.window]
-    target_usd = tick * 0.10
-    if estimate.interval is not None:
-        target_usd = max(0.02, min(estimate.interval.mid * 0.20, max(estimate.interval.width / 2.0, estimate.interval.mid * 0.02)))
-    target_blocks = target_usd / max(actuator.usd_per_block, 1e-12)
-    return int(actuator.header_tokens + target_blocks * actuator.tokens_per_block)
+    # One window-bisection sizer, no bootstrap/bulk/bisect branch: the next step is
+    #     max( bulk = BULK_UNDERSHOOT * (window.lo - now),  bisect = (window.hi - now) / 2 )
+    # Far below the window the bulk term dominates and undershoots window.lo (one fast jump
+    # over the dead zone); as `now` climbs into the window the bulk term falls to <=0 and the
+    # bisect term halves the remaining uncertainty. The regime switch lives in the values, not
+    # an `if`. [LAW:dataflow-not-control-flow] [LAW:no-mode-explosion]
+    # USD step -> blocks via observed usd_per_block -> input_tokens via the Stage A line;
+    # blocks_for_target_tokens clamps to MIN_PROMPT_TOKENS, so a <=0 step becomes a minimal
+    # real probe that still makes progress rather than stalling. [LAW:no-silent-failure]
+    now = estimate.measured_cost_usd
+    window = boundary_window(estimate, DEFAULT_TICK_USD[estimate.window])
+    bulk_usd = BULK_UNDERSHOOT * (window.lo - now)
+    bisect_usd = (window.hi - now) / 2.0
+    step_usd = max(bulk_usd, bisect_usd)
+    target_blocks = step_usd / max(actuator.usd_per_block, 1e-12)
+    target = int(actuator.header_tokens + target_blocks * actuator.tokens_per_block)
+    # A single call cannot exceed the prompt cap, so the *honest* target is the achievable
+    # one; reporting the pre-clamp number would misrepresent the step the loop actually takes.
+    # When a step is capped the dead zone simply takes several max-sized calls — the bisect
+    # phase still tightens the bracket once `now` reaches the window. [FRAMING:representation]
+    return max(MIN_PROMPT_TOKENS, min(MAX_PROMPT_TOKENS, target))
 
 
 def fit_block_line(samples: list[tuple[int, int]]) -> tuple[float, float] | None:

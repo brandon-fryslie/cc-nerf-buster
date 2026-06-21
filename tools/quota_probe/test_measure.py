@@ -120,11 +120,89 @@ def test_token_actuator_converges_and_tracks(tmp_path):
     for r in rows[2:]:
         assert abs(r["observed_input_tokens"] - r["input_tokens_target"]) <= 80
 
-    # The estimate's interval tightens as crossings accumulate.
+    # The estimate's interval tightens as crossings accumulate. The bulk-then-bisect sizer
+    # reaches a width the old uniform-step sizer could not (~0.05 on the same 60-call budget):
+    # 0.01 is a bar only the convergent sizer clears, locking in the >=5x improvement.
     widths = [r["relative_width"] for r in rows if r["relative_width"] is not None]
     assert len(widths) >= 2
     assert widths[-1] < widths[0]
-    assert widths[-1] <= 0.10
+    assert widths[-1] <= 0.01
+
+    # Per-crossing brackets shrink visibly across ticks: the bisect phase plants a small step
+    # at the boundary, so later crossings are far tighter than the bootstrap/anchor crossings.
+    crossings = json.loads((tmp_path / "fresh-bounds.json").read_text())["crossings"]
+    bracket_widths = [c["cost_after"] - c["cost_before"] for c in crossings]
+    assert len(bracket_widths) >= 4
+    assert min(bracket_widths[2:]) < bracket_widths[0] / 3.0
+
+
+def _estimate(measured_cost_usd, crossings, interval):
+    return Estimate(
+        schema_version=1,
+        status="estimated",
+        reason="",
+        window="5h",
+        loaded_events=len(crossings) + 2,
+        priced_events=len(crossings) + 2,
+        excluded_events=0,
+        measured_cost_usd=measured_cost_usd,
+        crossings=crossings,
+        interval=interval,
+        exclusions=[],
+    )
+
+
+def test_boundary_window_bootstrap_is_one_tick_from_now():
+    # No crossing yet: Q0 is unbracketed, so the next boundary is only known to lie within
+    # one prior tick of now. The window is that full-tick band starting at now.
+    est = _estimate(7.0, crossings=[], interval=None)
+    window = measure.boundary_window(est, prior_tick=2.75)
+    assert window.lo == pytest.approx(7.0)
+    assert window.hi == pytest.approx(7.0 + 2.75)
+
+
+def test_boundary_window_anchors_on_last_crossing_plus_interval():
+    from tools.quota_probe.estimator import Crossing
+    crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.3, line=5)]
+    est = _estimate(4.3, crossings=crossings, interval=Interval(2.0, 2.5))
+    window = measure.boundary_window(est, prior_tick=2.75)
+    # [cost_last_before + C_lo, cost_last_after + C_hi]
+    assert window.lo == pytest.approx(4.0 + 2.0)
+    assert window.hi == pytest.approx(4.3 + 2.5)
+
+
+def test_sizer_bulk_dominates_far_below_window():
+    from tools.quota_probe.estimator import Crossing
+    crossings = [Crossing(k=10, cost_before=0.0, cost_after=0.1, line=5)]
+    # now far below a narrow window [10.0, 10.6]; bulk = 0.9*(10.0-0.1) beats bisect = (10.6-0.1)/2.
+    est = _estimate(0.1, crossings=crossings, interval=Interval(10.0, 10.5))
+    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, usd_per_block=72.0 * 5e-6)
+    target = measure.target_input_tokens_for_estimate(est, actuator)
+    expected_usd = measure.BULK_UNDERSHOOT * (10.0 - 0.1)
+    expected = 25.0 + (expected_usd / actuator.usd_per_block) * 72.0
+    assert target == pytest.approx(min(measure.MAX_PROMPT_TOKENS, expected), rel=1e-6)
+
+
+def test_sizer_bisect_dominates_inside_window():
+    from tools.quota_probe.estimator import Crossing
+    crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.2, line=5)]
+    # now is inside the window [4.0+2.0, 4.2+2.5] = [6.0, 6.7]; bulk goes negative, bisect wins.
+    est = _estimate(6.3, crossings=crossings, interval=Interval(2.0, 2.5))
+    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, usd_per_block=72.0 * 5e-6)
+    target = measure.target_input_tokens_for_estimate(est, actuator)
+    expected_usd = (6.7 - 6.3) / 2.0
+    expected = 25.0 + (expected_usd / actuator.usd_per_block) * 72.0
+    assert target == pytest.approx(min(measure.MAX_PROMPT_TOKENS, expected), rel=1e-6)
+
+
+def test_sizer_floors_at_min_prompt_tokens_past_window():
+    from tools.quota_probe.estimator import Crossing
+    crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.2, line=5)]
+    # now beyond window.hi (prediction undershot): both terms <=0, so the sizer floors to a
+    # minimal real probe that still advances rather than stalling. [LAW:no-silent-failure]
+    est = _estimate(99.0, crossings=crossings, interval=Interval(2.0, 2.5))
+    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, usd_per_block=72.0 * 5e-6)
+    assert measure.target_input_tokens_for_estimate(est, actuator) == measure.MIN_PROMPT_TOKENS
 
 
 def test_active_run_rejects_unusable_events():
