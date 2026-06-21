@@ -205,17 +205,23 @@ def recalibrate(
 def served_input_tokens_since(path: Path, before_len: int) -> int | None:
     # Sum input_tokens over served (status-200) usage events appended after before_len.
     # None when no served event landed, so the caller never records a phantom sample.
+    # before_len counts non-empty lines (see usage_log_len), so a corrupt line is kept as
+    # a placeholder to preserve that index alignment — skipping it would misalign the slice
+    # and silently drop a real later event. Its decode failure is surfaced, not absorbed.
+    # [LAW:no-silent-failure]
     if not path.exists():
         return None
     rows: list[dict[str, Any]] = []
     with path.open() as f:
-        for line in f:
+        for line_num, line in enumerate(f, 1):
             stripped = line.strip()
-            if stripped:
-                try:
-                    rows.append(json.loads(stripped))
-                except json.JSONDecodeError:
-                    rows.append({})
+            if not stripped:
+                continue
+            try:
+                rows.append(json.loads(stripped))
+            except json.JSONDecodeError as exc:
+                print(f"warning: unparseable usage log line {line_num}: {exc}", file=sys.stderr)
+                rows.append({})
     served_total = 0
     found = False
     for row in rows[before_len:]:
