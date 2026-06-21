@@ -181,25 +181,27 @@ def recalibrate(
     estimate: Estimate,
     total_blocks: int,
     model: str,
-) -> Actuator:
+) -> tuple[Actuator, str | None]:
+    # Pure: computes the actuator and, on cost divergence, the *text* of a warning — but
+    # never emits it. drive() prints at the effect boundary. [LAW:effects-at-boundaries]
     fit = fit_block_line(samples)
     header_tokens, tokens_per_block = fit if fit is not None else (seed.header_tokens, seed.tokens_per_block)
     # Stage B: once the estimator has a cost interval, take usd/block from the priced
     # cost it actually measured (absorbs cache-write/output weighting by construction).
-    # Otherwise hold the no-cache seed. [LAW:no-silent-failure] divergence is reported below.
+    # Otherwise hold the no-cache seed. Divergence from the prediction is reported, not hidden.
+    warning: str | None = None
     if estimate.interval is not None and total_blocks > 0:
         usd_per_block = estimate.measured_cost_usd / total_blocks
         predicted = tokens_per_block * model_input_price_per_token(model)
         if predicted > 0 and usd_per_block > predicted * CACHE_WRITE_WARN_FACTOR:
-            print(
-                f"warning: observed usd/block {usd_per_block:.6g} exceeds the no-cache "
-                f"prediction {predicted:.6g} by >{CACHE_WRITE_WARN_FACTOR}x; cache-write "
-                "tokens are inflating cost",
-                file=sys.stderr,
+            warning = (
+                f"observed usd/block {usd_per_block:.6g} exceeds the no-cache prediction "
+                f"{predicted:.6g} by >{CACHE_WRITE_WARN_FACTOR}x; cache-write tokens are "
+                "inflating cost"
             )
     else:
         usd_per_block = tokens_per_block * model_input_price_per_token(model)
-    return Actuator(header_tokens, tokens_per_block, usd_per_block)
+    return Actuator(header_tokens, tokens_per_block, usd_per_block), warning
 
 
 def served_input_tokens_since(path: Path, before_len: int) -> int | None:
@@ -535,7 +537,9 @@ def drive(cfg: DriveConfig) -> Estimate:
     estimate = estimate_run(cfg.run_dir, cfg.window)
     if not cfg.dry_run:
         reject_unusable_active_events(estimate)
-    actuator = recalibrate(seed, samples, estimate, total_blocks, cfg.model)
+    actuator, warning = recalibrate(seed, samples, estimate, total_blocks, cfg.model)
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
 
     consecutive_failures = 0
     for iter_num in range(1, cfg.max_iters + 1):
@@ -569,7 +573,9 @@ def drive(cfg: DriveConfig) -> Estimate:
         estimate = estimate_run(cfg.run_dir, cfg.window)
         if not cfg.dry_run:
             reject_unusable_active_events(estimate)
-        actuator = recalibrate(seed, samples, estimate, total_blocks, cfg.model)
+        actuator, warning = recalibrate(seed, samples, estimate, total_blocks, cfg.model)
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
         append_jsonl(cfg.run_dir / "driver-iterations.jsonl", {
             "iter": iter_num,
             "ts": utc_now(),

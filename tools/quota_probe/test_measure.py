@@ -6,8 +6,24 @@ import json
 import pytest
 
 from tools.quota_probe import measure
-from tools.quota_probe.estimator import Estimate
+from tools.quota_probe.estimator import Estimate, Interval
 from tools.quota_probe.measure import DriveConfig, drive, reject_unusable_active_events
+
+
+def _estimate_with_cost(measured_cost_usd: float) -> Estimate:
+    return Estimate(
+        schema_version=1,
+        status="estimated",
+        reason="",
+        window="5h",
+        loaded_events=2,
+        priced_events=2,
+        excluded_events=0,
+        measured_cost_usd=measured_cost_usd,
+        crossings=[],
+        interval=Interval(2.0, 3.0),
+        exclusions=[],
+    )
 
 
 def _cfg(tmp_path):
@@ -57,6 +73,25 @@ def test_fit_block_line_recovers_constants():
     assert abs(a - a_true) < 1.0
     # one point cannot separate intercept from slope
     assert measure.fit_block_line([(5, 360)]) is None
+
+
+def test_recalibrate_flags_cache_write_inflation():
+    # b=72 -> no-cache prediction is 72 * opus input price. recalibrate stays pure:
+    # it returns the warning text, never prints it. [LAW:effects-at-boundaries]
+    seed = measure.seed_actuator("claude-opus-4-7")
+    samples = [(0, 25), (100, 25 + 100 * 72)]
+    predicted = 72 * measure.model_input_price_per_token("claude-opus-4-7")
+
+    # observed usd/block well above predicted * 1.5 -> warning
+    inflated = predicted * 100 * 3.0  # total_blocks=100
+    actuator, warning = measure.recalibrate(seed, samples, _estimate_with_cost(inflated), 100, "claude-opus-4-7")
+    assert abs(actuator.tokens_per_block - 72) < 0.5
+    assert warning is not None and "cache-write" in warning
+
+    # observed usd/block matching the prediction -> no warning
+    onprice = predicted * 100
+    _, clean = measure.recalibrate(seed, samples, _estimate_with_cost(onprice), 100, "claude-opus-4-7")
+    assert clean is None
 
 
 def test_token_actuator_converges_and_tracks(tmp_path):
