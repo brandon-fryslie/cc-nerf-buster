@@ -81,7 +81,7 @@ Keep this order legible. If you change behavior, do it by changing the data pass
 
 - Model pricing has two required representations today:
   - `anthropic.go`: `modelPricing`
-  - `tools/capacity-probe/report.py`: `PRICING`
+  - `tools/capacity_probe/report.py`: `PRICING`
 - If pricing changes, update both in the same change and explain the synchronization point in code/comments. `// [LAW:one-source-of-truth] pricing inputs must remain explicitly synchronized across runtime and reporting`
 
 ## Working Rules
@@ -139,7 +139,7 @@ For metrics/quota work, also verify at least one of:
 
 - estimator persistence/load behavior
 - metrics exposition for the changed counters/gauges
-- capacity-probe compatibility if pricing or report inputs changed
+- capacity_probe compatibility if pricing or report inputs changed
 
 Do not hand testing back to the user unless there is no deterministic way to verify locally. `// [LAW:verifiable-goals] agent work is not complete without concrete verification when verification is possible`
 
@@ -151,7 +151,7 @@ Do not hand testing back to the user unless there is no deterministic way to ver
 - `metrics.go`: counters, gauges, quota estimators, persistence
 - `log.go`: JSONL event sink
 - `throttle.go`: throttled operational logging
-- `tools/capacity-probe/`: external calibration and reporting workflow
+- `tools/capacity_probe/`: external calibration and reporting workflow
 
 ## When Unsure
 

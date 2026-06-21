@@ -23,13 +23,10 @@ that records Crossings) and the design check for nerf-convergent-probe-xkh.2
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 # // [LAW:one-source-of-truth] Re-use the canonical Crossing/Interval types
 # and the new estimator from `crossings.py` instead of forking arithmetic.
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
 from crossings import (
     Crossing,
     Interval,

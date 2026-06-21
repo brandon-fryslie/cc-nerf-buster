@@ -1,5 +1,5 @@
 // mock-anthropic emulates the slice of api.anthropic.com/v1/messages that
-// the cc-nerf-buster proxy and capacity-probe consume: a streaming SSE
+// the cc-nerf-buster proxy and capacity_probe consume: a streaming SSE
 // response carrying usage tokens plus the unified rate-limit utilization
 // headers. State is server-local: each request advances a cumulative
 // input-equivalent cost counter, which is divided by the configured per-

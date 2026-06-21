@@ -18,7 +18,7 @@ The report.py bounds-summary tests at the bottom of this file remain
 unchanged — they cover a separate concern and are still load-bearing.
 
 Run with:
-    uv run --with rich python -m pytest tools/capacity-probe/test_leading_bracket.py -v
+    uv run --with rich python -m pytest tools/capacity_probe/test_leading_bracket.py -v
 """
 from __future__ import annotations
 

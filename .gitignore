@@ -15,7 +15,7 @@ __pycache__/
 *.py[cod]
 
 # Probe run outputs
-tools/capacity-probe/probe-runs/
+tools/capacity_probe/probe-runs/
 
 # TLS material (MITM CA + leaf certs)
 ca.crt

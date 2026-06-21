@@ -96,7 +96,7 @@ just build && just test && just vet         # build and verify the proxy itself
 
 ## Legacy Capacity Probe
 
-The older `tools/capacity-probe/` workflow remains available for comparison:
+The older `tools/capacity_probe/` workflow remains available for comparison:
 
 ```bash
 just probe-5h
