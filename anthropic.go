@@ -167,6 +167,7 @@ var modelPricing = map[string]struct{ Input, Output float64 }{
 	"claude-sonnet-4-6":         {3.00, 15.00},
 	"claude-opus-4-6":           {5.00, 25.00},
 	"claude-opus-4-7":           {5.00, 25.00},
+	"claude-opus-4-8":           {5.00, 25.00},
 }
 
 // Multipliers relative to base input price. Source: docs/pricing.md.

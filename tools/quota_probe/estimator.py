@@ -77,6 +77,7 @@ MODEL_PRICING = {
     "claude-sonnet-4-6": Pricing(3.00, 15.00),
     "claude-opus-4-6": Pricing(5.00, 25.00),
     "claude-opus-4-7": Pricing(5.00, 25.00),
+    "claude-opus-4-8": Pricing(5.00, 25.00),
 }
 
 CACHE_WRITE_5M_MULTIPLIER = 1.25

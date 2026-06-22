@@ -11,6 +11,7 @@ Update both together.
 
 | Model | Base Input | 5m Cache Write | 1h Cache Write | Cache Hit / Refresh | Output |
 |-------|-----------:|---------------:|---------------:|--------------------:|-------:|
+| Claude Opus 4.8   | $5     | $6.25  | $10    | $0.50 | $25     |
 | Claude Opus 4.7   | $5     | $6.25  | $10    | $0.50 | $25     |
 | Claude Opus 4.6   | $5     | $6.25  | $10    | $0.50 | $25     |
 | Claude Opus 4.5   | $5     | $6.25  | $10    | $0.50 | $25     |
