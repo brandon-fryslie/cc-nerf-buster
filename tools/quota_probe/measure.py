@@ -59,6 +59,16 @@ MAX_PROMPT_TOKENS = 64_000
 # undershoot is safe. [LAW:no-silent-failure] an overshoot is still recorded as a
 # wide crossing, never discarded.
 BULK_UNDERSHOOT = 0.9
+# The localize step is a fixed fraction of one tick, so the crossing it produces is
+# bracketed to that fraction REGARDLESS of where in the boundary window it falls — a
+# forward-only (irreversible) threshold search has no logarithmic shortcut, so a
+# guaranteed-tight bracket is a fixed small step, not a halving of the wide window.
+# COARSE is used before any crossing anchors Q0 (the boundary is only known to within a
+# full tick, so we find it fast and accept a wide bracket that only anchors Q0); FINE is
+# used once a crossing exists, to bracket every subsequent boundary to ~FINE of a tick.
+# These are the accuracy/speed lever: smaller FINE -> tighter bracket, more localize calls.
+COARSE_TICK_FRACTION = 0.1
+FINE_TICK_FRACTION = 0.02
 PROMPT_HEADER = "Read the operational note and reply with exactly: ok\n\n"
 PROMPT_PARAGRAPH = (
     "Operational measurement note. The request describes ordinary service "
@@ -169,34 +179,46 @@ def boundary_window(estimate: Estimate, prior_tick: float) -> Interval:
     # mode, just the window value when no anchor exists yet. [LAW:one-source-of-truth] C
     # lives only in estimate.interval; the Q0 anchor is only the most recent crossing.
     now = estimate.measured_cost
-    if estimate.crossings:
+    if estimate.crossings and estimate.interval is not None:
         anchor = estimate.crossings[-1]
-        c = estimate.interval or Interval(prior_tick, prior_tick)
+        c = estimate.interval
         return Interval(anchor.cost_before + c.lo, anchor.cost_after + c.hi)
+    # No usable C yet (zero crossings, or one crossing that cannot pair into an interval):
+    # the next boundary is only known to within one prior tick of now. Anchoring on a single
+    # crossing would instead predict it one *prior* tick out, and the prior runs ~3x the real
+    # tick — bulk would then steam-roll straight through the true next boundary, widening its
+    # bracket. So we keep searching from now until a real interval exists. [LAW:no-silent-failure]
     return Interval(now, now + prior_tick)
 
 
 def target_input_tokens_for_estimate(estimate: Estimate, actuator: Actuator) -> int:
-    # One window-bisection sizer, no bootstrap/bulk/bisect branch: the next step is
-    #     max( bulk = BULK_UNDERSHOOT * (window.lo - now),  bisect = (window.hi - now) / 2 )
-    # Far below the window the bulk term dominates and undershoots window.lo (one fast jump
-    # over the dead zone); as `now` climbs into the window the bulk term falls to <=0 and the
-    # bisect term halves the remaining uncertainty. The regime switch lives in the values, not
-    # an `if`. [LAW:dataflow-not-control-flow] [LAW:no-mode-explosion]
-    # cost step -> blocks via observed cost_per_block -> input_tokens via the Stage A line;
-    # blocks_for_target_tokens clamps to MIN_PROMPT_TOKENS, so a <=0 step becomes a minimal
-    # real probe that still makes progress rather than stalling. [LAW:no-silent-failure]
+    # One sizer, two terms, no phase branch:
+    #     step = max( bulk = BULK_UNDERSHOOT * (window.lo - now),  fine = resolution * tick )
+    # bulk carries `now` to the near edge of the boundary window in capped jumps over the dead
+    # zone, then falls to <=0 once `now` is inside the window. The localize term is then a
+    # FIXED fraction of a tick, so whichever step actually crosses brackets the boundary to
+    # <= that fraction regardless of where in the window the boundary falls. Bisecting toward
+    # window.hi (the old `(window.hi - now)/2`) instead left the bracket ~half the window
+    # whenever the true boundary sat near the near edge — the wide-bracket bug.
+    # The resolution is the one value carrying the regime: until a usable C interval exists
+    # (zero or one crossing), the boundary prediction is unreliable, so window.lo == now,
+    # bulk == 0, and COARSE searches for the next boundary fast; once two crossings give a real
+    # interval, bulk jumps the dead zone and FINE brackets every subsequent boundary tightly.
+    # The live tick estimate scales the resolution as C is learned. [LAW:dataflow-not-control-flow]
+    # [LAW:no-mode-explosion]
     now = estimate.measured_cost
+    tick = estimate.interval.mid if estimate.interval is not None else DEFAULT_TICK_COST[estimate.window]
     window = boundary_window(estimate, DEFAULT_TICK_COST[estimate.window])
+    resolution = FINE_TICK_FRACTION if estimate.interval is not None else COARSE_TICK_FRACTION
     bulk_cost = BULK_UNDERSHOOT * (window.lo - now)
-    bisect_cost = (window.hi - now) / 2.0
-    step_cost = max(bulk_cost, bisect_cost)
+    fine_cost = resolution * tick
+    step_cost = max(bulk_cost, fine_cost)
     target_blocks = step_cost / max(actuator.cost_per_block, 1e-12)
     target = int(actuator.header_tokens + target_blocks * actuator.tokens_per_block)
     # A single call cannot exceed the prompt cap, so the *honest* target is the achievable
     # one; reporting the pre-clamp number would misrepresent the step the loop actually takes.
-    # When a step is capped the dead zone simply takes several max-sized calls — the bisect
-    # phase still tightens the bracket once `now` reaches the window. [FRAMING:representation]
+    # A capped dead-zone jump simply takes several max calls; the fine term keeps every step
+    # at least one resolution wide so the loop never stalls on a near-zero bulk. [FRAMING:representation]
     return max(MIN_PROMPT_TOKENS, min(MAX_PROMPT_TOKENS, target))
 
 

@@ -171,6 +171,18 @@ def test_boundary_window_anchors_on_last_crossing_plus_interval():
     assert window.hi == pytest.approx(4.3 + 2.5)
 
 
+def test_boundary_window_one_crossing_no_interval_stays_bootstrap():
+    # A single crossing cannot pair into an interval, so there is no trustworthy C: anchoring
+    # on it would predict the next boundary one *prior* tick out (the prior runs ~3x the real
+    # tick) and bulk would blow through the true boundary. The window stays the bootstrap band.
+    from tools.quota_probe.estimator import Crossing
+    crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.3, line=5)]
+    est = _estimate(4.3, crossings=crossings, interval=None)
+    window = measure.boundary_window(est, prior_tick=2.75)
+    assert window.lo == pytest.approx(4.3)
+    assert window.hi == pytest.approx(4.3 + 2.75)
+
+
 def test_sizer_bulk_dominates_far_below_window():
     from tools.quota_probe.estimator import Crossing
     crossings = [Crossing(k=10, cost_before=0.0, cost_after=0.1, line=5)]
@@ -183,26 +195,56 @@ def test_sizer_bulk_dominates_far_below_window():
     assert target == pytest.approx(min(measure.MAX_PROMPT_TOKENS, expected), rel=1e-6)
 
 
-def test_sizer_bisect_dominates_inside_window():
-    from tools.quota_probe.estimator import Crossing
-    crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.2, line=5)]
-    # now is inside the window [4.0+2.0, 4.2+2.5] = [6.0, 6.7]; bulk goes negative, bisect wins.
-    est = _estimate(6.3, crossings=crossings, interval=Interval(2.0, 2.5))
+def test_sizer_coarse_resolution_before_first_crossing():
+    # No crossing yet: window.lo == now so bulk == 0, and the step is one COARSE resolution of
+    # the prior tick — a fast, wide search for the first boundary that only has to anchor Q0.
+    est = _estimate(7.0, crossings=[], interval=None)
     actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, cost_per_block=72.0 * 5e-6)
     target = measure.target_input_tokens_for_estimate(est, actuator)
-    expected_cost = (6.7 - 6.3) / 2.0
+    expected_cost = measure.COARSE_TICK_FRACTION * measure.DEFAULT_TICK_COST[est.window]
     expected = 25.0 + (expected_cost / actuator.cost_per_block) * 72.0
     assert target == pytest.approx(min(measure.MAX_PROMPT_TOKENS, expected), rel=1e-6)
 
 
-def test_sizer_floors_at_min_prompt_tokens_past_window():
+def test_sizer_coarse_resolution_with_one_crossing_no_interval():
+    # One crossing but no interval yet: still a coarse search (bulk == 0 on the bootstrap
+    # window), so the next boundary is found fast rather than bulk-predicted off the bad prior.
+    from tools.quota_probe.estimator import Crossing
+    crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.3, line=5)]
+    est = _estimate(4.3, crossings=crossings, interval=None)
+    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, cost_per_block=72.0 * 5e-6)
+    target = measure.target_input_tokens_for_estimate(est, actuator)
+    expected_cost = measure.COARSE_TICK_FRACTION * measure.DEFAULT_TICK_COST[est.window]
+    expected = int(25.0 + (expected_cost / actuator.cost_per_block) * 72.0)
+    assert target == max(measure.MIN_PROMPT_TOKENS, min(measure.MAX_PROMPT_TOKENS, expected))
+
+
+def test_sizer_fine_resolution_inside_window():
     from tools.quota_probe.estimator import Crossing
     crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.2, line=5)]
-    # now beyond window.hi (prediction undershot): both terms <=0, so the sizer floors to a
-    # minimal real probe that still advances rather than stalling. [LAW:no-silent-failure]
+    # now is inside the window [4.0+2.0, 4.2+2.5] = [6.0, 6.7]; bulk goes negative, so the step
+    # is one FINE resolution of the live tick — a fixed bracket independent of the window width.
+    est = _estimate(6.3, crossings=crossings, interval=Interval(2.0, 2.5))
+    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, cost_per_block=72.0 * 5e-6)
+    target = measure.target_input_tokens_for_estimate(est, actuator)
+    expected_cost = measure.FINE_TICK_FRACTION * Interval(2.0, 2.5).mid
+    expected = int(25.0 + (expected_cost / actuator.cost_per_block) * 72.0)
+    assert target == max(measure.MIN_PROMPT_TOKENS, min(measure.MAX_PROMPT_TOKENS, expected))
+
+
+def test_sizer_fine_step_past_window_does_not_stall_or_widen():
+    from tools.quota_probe.estimator import Crossing
+    crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.2, line=5)]
+    # now beyond window.hi (prediction undershot): bulk goes deeply negative, so the step stays
+    # one bounded FINE resolution — the loop keeps advancing in tight steps rather than stalling
+    # at MIN or blowing the bracket wide. [LAW:no-silent-failure]
     est = _estimate(99.0, crossings=crossings, interval=Interval(2.0, 2.5))
     actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, cost_per_block=72.0 * 5e-6)
-    assert measure.target_input_tokens_for_estimate(est, actuator) == measure.MIN_PROMPT_TOKENS
+    target = measure.target_input_tokens_for_estimate(est, actuator)
+    expected_cost = measure.FINE_TICK_FRACTION * Interval(2.0, 2.5).mid
+    expected = int(25.0 + (expected_cost / actuator.cost_per_block) * 72.0)
+    assert target == max(measure.MIN_PROMPT_TOKENS, min(measure.MAX_PROMPT_TOKENS, expected))
+    assert target > measure.MIN_PROMPT_TOKENS
 
 
 def test_claude_env_disables_nonessential_model_calls(monkeypatch, tmp_path):
