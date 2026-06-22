@@ -50,11 +50,11 @@ Each request's tokens are converted into a weighted cost. The current probe trea
 Each crossing is a position constraint on the unknown per-tick capacity. Pairing two crossings cancels the unknown quota usage that existed before the run started; intersecting all such pairwise constraints yields the final capacity interval. Multiplying the per-tick interval by 100 gives the full-window quota interval.
 
 ```
-weighted_usd(req) =
+cost(req) =                                  # in opus cache-write tokens
   (
     model_input_price × (input + 1.25×cache_write_5m + 2×cache_write_1h + 0.1×cache_read)
     + model_output_price × output
-  ) / 1,000,000
+  ) / 1,000,000 × NORMALIZED_COST_SCALE
 
 crossing[k] = cost at which utilization crossed k%
 C_interval = intersection over crossing pairs (a,b):

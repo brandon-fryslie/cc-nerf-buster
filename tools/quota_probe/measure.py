@@ -18,11 +18,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.quota_probe.estimator import (
     MODEL_PRICING,
+    NORMALIZED_COST_SCALE,
     Estimate,
     Interval,
     estimate_usage_log,
     number,
-    request_cost_usd,
+    request_cost,
 )
 
 
@@ -35,9 +36,12 @@ DEFAULT_CLAUDE_TIMEOUT_SECONDS = 180
 MAX_CALL_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 2.0
 MAX_CONSECUTIVE_FAILURES = 5
-DEFAULT_TICK_USD = {
-    "5h": 2.75,
-    "7d": 14.0,
+# Prior per-tick size, in NORMALIZED_COST_UNIT, used only to bootstrap iter sizing
+# before the live interval exists. Same order of magnitude as the measured per-tick
+# cost (see README), refined away the moment a crossing is observed.
+DEFAULT_TICK_COST = {
+    "5h": 275_000.0,
+    "7d": 1_400_000.0,
 }
 # The actuator steers prompt size in input tokens — the billed unit — not chars.
 # The prompt is PROMPT_HEADER followed by a whole number of fixed PROMPT_PARAGRAPH
@@ -67,7 +71,7 @@ PROMPT_PARAGRAPH = (
 # rather than that the simulator was handed the actuator's own numbers. [LAW:behavior-not-structure]
 DRYRUN_TRUE_HEADER_TOKENS = 25.0
 DRYRUN_TRUE_TOKENS_PER_BLOCK = 72.0
-# Observed usd/block diverging from the no-cache price prediction by more than this
+# Observed cost/block diverging from the no-cache prediction by more than this
 # factor means cache-write tokens are inflating cost; surfaced, never silently absorbed.
 CACHE_WRITE_WARN_FACTOR = 1.5
 
@@ -115,27 +119,28 @@ def die(message: str) -> "NoReturn":
 class Actuator:
     # The live model of how a prompt becomes cost, in two separately-calibrated stages:
     #   header_tokens, tokens_per_block : prompt blocks -> input_tokens (Stage A, deterministic)
-    #   usd_per_block                   : prompt blocks -> priced cost  (Stage B, cache-robust)
+    #   cost_per_block                  : prompt blocks -> measured cost (Stage B, cache-robust)
     # [LAW:one-source-of-truth] this is the single place the actuator's knowledge lives.
     header_tokens: float
     tokens_per_block: float
-    usd_per_block: float
+    cost_per_block: float
 
 
-def model_input_price_per_token(model: str) -> float:
-    # [LAW:one-source-of-truth] prices come from the estimator's table, never duplicated here.
+def model_input_cost_per_token(model: str) -> float:
+    # Normalized cost (NORMALIZED_COST_UNIT) of one fresh input token.
+    # [LAW:one-source-of-truth] weighting comes from the estimator's table, never duplicated here.
     pricing = MODEL_PRICING.get(model.strip())
     if pricing is None:
         die(f"unknown model {model!r}: no pricing to seed the actuator")
-    return pricing.input_per_mtok / 1_000_000.0
+    return pricing.input_per_mtok / 1_000_000.0 * NORMALIZED_COST_SCALE
 
 
 def seed_actuator(model: str) -> Actuator:
     tokens_per_block = DEFAULT_TOKENS_PER_BLOCK
-    # Seed Stage B from the no-cache price law; this is a bootstrap value, not the
+    # Seed Stage B from the no-cache cost law; this is a bootstrap value, not the
     # actuation path — it is replaced by observed cost as soon as the estimate exists.
-    usd_per_block = tokens_per_block * model_input_price_per_token(model)
-    return Actuator(DEFAULT_HEADER_TOKENS, tokens_per_block, usd_per_block)
+    cost_per_block = tokens_per_block * model_input_cost_per_token(model)
+    return Actuator(DEFAULT_HEADER_TOKENS, tokens_per_block, cost_per_block)
 
 
 def build_prompt(blocks: int) -> str:
@@ -163,7 +168,7 @@ def boundary_window(estimate: Estimate, prior_tick: float) -> Interval:
     # one C of now — a full-tick-wide window starting at now. That is the bootstrap: not a
     # mode, just the window value when no anchor exists yet. [LAW:one-source-of-truth] C
     # lives only in estimate.interval; the Q0 anchor is only the most recent crossing.
-    now = estimate.measured_cost_usd
+    now = estimate.measured_cost
     if estimate.crossings:
         anchor = estimate.crossings[-1]
         c = estimate.interval or Interval(prior_tick, prior_tick)
@@ -178,15 +183,15 @@ def target_input_tokens_for_estimate(estimate: Estimate, actuator: Actuator) -> 
     # over the dead zone); as `now` climbs into the window the bulk term falls to <=0 and the
     # bisect term halves the remaining uncertainty. The regime switch lives in the values, not
     # an `if`. [LAW:dataflow-not-control-flow] [LAW:no-mode-explosion]
-    # USD step -> blocks via observed usd_per_block -> input_tokens via the Stage A line;
+    # cost step -> blocks via observed cost_per_block -> input_tokens via the Stage A line;
     # blocks_for_target_tokens clamps to MIN_PROMPT_TOKENS, so a <=0 step becomes a minimal
     # real probe that still makes progress rather than stalling. [LAW:no-silent-failure]
-    now = estimate.measured_cost_usd
-    window = boundary_window(estimate, DEFAULT_TICK_USD[estimate.window])
-    bulk_usd = BULK_UNDERSHOOT * (window.lo - now)
-    bisect_usd = (window.hi - now) / 2.0
-    step_usd = max(bulk_usd, bisect_usd)
-    target_blocks = step_usd / max(actuator.usd_per_block, 1e-12)
+    now = estimate.measured_cost
+    window = boundary_window(estimate, DEFAULT_TICK_COST[estimate.window])
+    bulk_cost = BULK_UNDERSHOOT * (window.lo - now)
+    bisect_cost = (window.hi - now) / 2.0
+    step_cost = max(bulk_cost, bisect_cost)
+    target_blocks = step_cost / max(actuator.cost_per_block, 1e-12)
     target = int(actuator.header_tokens + target_blocks * actuator.tokens_per_block)
     # A single call cannot exceed the prompt cap, so the *honest* target is the achievable
     # one; reporting the pre-clamp number would misrepresent the step the loop actually takes.
@@ -227,22 +232,22 @@ def recalibrate(
     # never emits it. drive() prints at the effect boundary. [LAW:effects-at-boundaries]
     fit = fit_block_line(samples)
     header_tokens, tokens_per_block = fit if fit is not None else (seed.header_tokens, seed.tokens_per_block)
-    # Stage B: once the estimator has a cost interval, take usd/block from the priced
+    # Stage B: once the estimator has a cost interval, take cost/block from the
     # cost it actually measured (absorbs cache-write/output weighting by construction).
     # Otherwise hold the no-cache seed. Divergence from the prediction is reported, not hidden.
     warning: str | None = None
     if estimate.interval is not None and total_blocks > 0:
-        usd_per_block = estimate.measured_cost_usd / total_blocks
-        predicted = tokens_per_block * model_input_price_per_token(model)
-        if predicted > 0 and usd_per_block > predicted * CACHE_WRITE_WARN_FACTOR:
+        cost_per_block = estimate.measured_cost / total_blocks
+        predicted = tokens_per_block * model_input_cost_per_token(model)
+        if predicted > 0 and cost_per_block > predicted * CACHE_WRITE_WARN_FACTOR:
             warning = (
-                f"observed usd/block {usd_per_block:.6g} exceeds the no-cache prediction "
+                f"observed cost/block {cost_per_block:.6g} exceeds the no-cache prediction "
                 f"{predicted:.6g} by >{CACHE_WRITE_WARN_FACTOR}x; cache-write tokens are "
                 "inflating cost"
             )
     else:
-        usd_per_block = tokens_per_block * model_input_price_per_token(model)
-    return Actuator(header_tokens, tokens_per_block, usd_per_block), warning
+        cost_per_block = tokens_per_block * model_input_cost_per_token(model)
+    return Actuator(header_tokens, tokens_per_block, cost_per_block), warning
 
 
 def served_input_tokens_since(path: Path, before_len: int) -> int | None:
@@ -481,12 +486,12 @@ def append_synthetic_event(run_dir: Path, *, cfg: DriveConfig, actual_spend: flo
     # seed_actuator already rejected unknown models, so None here is a broken invariant,
     # not an expected input — surface it instead of coercing to a zero-cost event that
     # would silently corrupt the estimate. [LAW:no-silent-failure]
-    cost_usd = request_cost_usd(cfg.model, {"input_tokens": input_tokens})
-    if cost_usd is None:
+    cost = request_cost(cfg.model, {"input_tokens": input_tokens})
+    if cost is None:
         die(f"dry-run pricing returned no cost for model {cfg.model!r}; seed_actuator should have rejected it")
-    tick_usd = DEFAULT_TICK_USD[cfg.window]
-    new_spend = actual_spend + cost_usd
-    util_bucket = min(100, int(new_spend / tick_usd))
+    tick = DEFAULT_TICK_COST[cfg.window]
+    new_spend = actual_spend + cost
+    util_bucket = min(100, int(new_spend / tick))
     append_jsonl(
         run_dir / "usage.jsonl",
         synthetic_event(
@@ -526,19 +531,18 @@ def render_report(data: dict[str, Any]) -> str:
         f"- Crossings: {data['crossing_count']}",
         "",
     ]
-    if data["weighted_usd_per_tick"] is None:
+    if data["cost_per_tick"] is None:
         lines.append("No capacity estimate is available from this artifact set.")
     else:
-        usd = data["weighted_usd_per_tick"]
-        ocw = data["opus_cache_write_tokens"]["per_tick"]
-        full = data["opus_cache_write_tokens"]["full_quota"]
+        unit = data["cost_unit"]
+        per_tick = data["cost_per_tick"]
+        full = data["cost_full_quota"]
         lines.extend([
             "## Estimate",
             "",
-            f"- Weighted USD / 1% tick: low={usd['low']:.6f} mid={usd['midpoint']:.6f} high={usd['high']:.6f}",
-            f"- Relative interval width: {usd['relative_width'] * 100:.3f}%",
-            f"- Opus cache-write tokens / 1% tick: low={ocw['low']:.0f} mid={ocw['midpoint']:.0f} high={ocw['high']:.0f}",
-            f"- Opus cache-write full quota: low={full['low']:.0f} mid={full['midpoint']:.0f} high={full['high']:.0f}",
+            f"- Cost / 1% tick ({unit}): low={per_tick['low']:.0f} mid={per_tick['midpoint']:.0f} high={per_tick['high']:.0f}",
+            f"- Relative interval width: {per_tick['relative_width'] * 100:.3f}%",
+            f"- Full quota ({unit}): low={full['low']:.0f} mid={full['midpoint']:.0f} high={full['high']:.0f}",
         ])
     if data["exclusions"]:
         lines.extend(["", "## Exclusions", ""])
@@ -590,7 +594,7 @@ def drive(cfg: DriveConfig) -> Estimate:
     # files on disk, which would include skipped/failed iters. [LAW:one-source-of-truth]
     samples: list[tuple[int, int]] = []
     total_blocks = 0
-    dry_spend = DEFAULT_TICK_USD[cfg.window] * 23.37
+    dry_spend = DEFAULT_TICK_COST[cfg.window] * 23.37
 
     # Warmup at blocks=0: a served event at the Stage-A intercept, anchoring header_tokens.
     before = usage_log_len(usage_path)
@@ -652,7 +656,7 @@ def drive(cfg: DriveConfig) -> Estimate:
             "blocks": blocks,
             "observed_input_tokens": observed,
             "tokens_per_block": actuator.tokens_per_block,
-            "usd_per_block": actuator.usd_per_block,
+            "cost_per_block": actuator.cost_per_block,
             "relative_width": None if estimate.interval is None else estimate.interval.relative_width,
         })
         if stop_reached(estimate, cfg):
