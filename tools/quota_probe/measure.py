@@ -27,7 +27,7 @@ from tools.quota_probe.estimator import (
 )
 
 
-DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "claude-opus-4-8"
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 180
 # A probe that pushes utilization toward the limit is the workload most likely to
 # be throttled, so transient failures are expected. Retry a call a few times,
