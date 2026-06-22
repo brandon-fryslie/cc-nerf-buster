@@ -285,6 +285,25 @@ def claude_env(run_dir: Path) -> dict[str, str]:
         "http_proxy": proxy_url,
         "HTTP_PROXY": proxy_url,
     })
+    # Each `claude -p` otherwise fires a SECOND model call — a claude-haiku session-title
+    # generation that re-sends the whole prompt — billed against the same quota and counted
+    # by the estimator, so measured cost no longer represents the probe's own opus traffic.
+    # This flag suppresses it: verified on real traffic (HAR) that a 60k-token prompt then
+    # yields exactly one served opus event, no haiku. The exact token is read from the CLI
+    # binary, not guessed. [LAW:effects-at-boundaries] fix the contaminating effect at its
+    # source, not by subtracting it downstream; [FRAMING:representation] the measurement must
+    # equal the thing it measures.
+    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    #
+    # Two CLI behaviors each break the cost model; both must be off, and they masked each other:
+    #  - the haiku title call (above) re-sent the prompt as input_tokens;
+    #  - prompt caching shunts the prompt into cache_creation, leaving input_tokens ~6 and
+    #    making per-call cost non-linear (create at >=1.25x, later read at 0.1x) -> disjoint
+    #    crossing constraints. Disabling it bills the prompt as plain input_tokens, restoring
+    #    the linear input_tokens = header + blocks*tokens_per_block the actuator assumes.
+    # Verified on real traffic: with both off, a 60k-token prompt yields one opus event with
+    # the whole prompt in input_tokens and cc=cr=0. [LAW:no-silent-failure]
+    env["DISABLE_PROMPT_CACHING"] = "1"
     ca_cert = env.get("CCNB_CA_CERT")
     if ca_cert:
         env.update({

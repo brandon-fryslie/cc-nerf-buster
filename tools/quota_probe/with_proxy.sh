@@ -95,6 +95,7 @@ if ! https_proxy="${PROXY_URL}" HTTPS_PROXY="${PROXY_URL}" \
      http_proxy="${PROXY_URL}" HTTP_PROXY="${PROXY_URL}" \
      NODE_EXTRA_CA_CERTS="${CA_CERT}" SSL_CERT_FILE="${CA_CERT}" \
      CURL_CA_BUNDLE="${CA_CERT}" REQUESTS_CA_BUNDLE="${CA_CERT}" \
+     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_PROMPT_CACHING=1 \
      claude -p --model "${MODEL}" --system-prompt '' \
             --no-session-persistence --tools '' \
             -- "Reply with the single word: ok" \
