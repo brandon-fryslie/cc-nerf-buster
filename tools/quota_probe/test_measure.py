@@ -205,6 +205,20 @@ def test_sizer_floors_at_min_prompt_tokens_past_window():
     assert measure.target_input_tokens_for_estimate(est, actuator) == measure.MIN_PROMPT_TOKENS
 
 
+def test_claude_env_disables_nonessential_model_calls(monkeypatch, tmp_path):
+    # Without this, each `claude -p` fires a second (haiku title-generation) model call that
+    # re-sends the prompt and is billed against the same quota, contaminating measured cost.
+    # The probe's invocation env MUST suppress it so one served opus event maps to one call.
+    # The tokens are the ones the CLI binary actually reads; verified on real traffic. Both are
+    # required and masked each other: the title call re-sent the prompt as input_tokens, while
+    # prompt caching shunted it into cache_creation. Only with both off does input_tokens equal
+    # the prompt the actuator built.
+    monkeypatch.setenv("PROXY_URL", "http://localhost:9")
+    env = measure.claude_env(tmp_path)
+    assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert env["DISABLE_PROMPT_CACHING"] == "1"
+
+
 def test_active_run_rejects_unusable_events():
     estimate = Estimate(
         schema_version=1,
