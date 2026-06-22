@@ -57,6 +57,14 @@ probe-dry-7d *ARGS:
 probe-report RUN_DIR WINDOW:
     python3 tools/quota_probe/measure.py report {{RUN_DIR}} --window {{WINDOW}} --print
 
+# Legacy capacity_probe estimator, 5h window — kept for cross-checking probe-5h.
+probe-5h-legacy *ARGS:
+    cd tools/capacity_probe && bash with-proxy.sh --window=5h {{ARGS}}
+
+# Legacy capacity_probe estimator, 7d window — kept for cross-checking probe-7d.
+probe-7d-legacy *ARGS:
+    cd tools/capacity_probe && bash with-proxy.sh --window=7d {{ARGS}}
+
 # Compute quota capacity from all observed traffic in usage.jsonl (no quota spent).
 passive-report *ARGS:
     python3 tools/capacity_probe/passive-report.py {{ARGS}}
