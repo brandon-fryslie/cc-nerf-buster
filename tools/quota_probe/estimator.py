@@ -82,7 +82,17 @@ MODEL_PRICING = {
 CACHE_WRITE_5M_MULTIPLIER = 1.25
 CACHE_WRITE_1H_MULTIPLIER = 2.00
 CACHE_READ_MULTIPLIER = 0.10
-OPUS_CACHE_WRITE_USD_PER_MTOK = 10.0
+
+# [LAW:one-source-of-truth] [LAW:carrying-cost] [FRAMING:representation]
+# The ONE definition of the normalized cost unit. Every "cost" in this probe is a
+# scalar in this unit; identifiers name the ROLE ("cost"), never the unit, so a
+# future unit change touches only this block, the rescale, and the output label —
+# nothing else. MODEL_PRICING supplies the relative per-token-type weighting (a
+# price ratio in a per-Mtok scale); dividing that weighted sum by the reference
+# unit's weight reprojects it into a count of reference-unit tokens.
+NORMALIZED_COST_UNIT = "opus cache-write tokens"
+_REFERENCE_WEIGHT_PER_MTOK = 10.0  # opus 1h cache-write weight, in MODEL_PRICING's per-Mtok scale
+NORMALIZED_COST_SCALE = 1_000_000.0 / _REFERENCE_WEIGHT_PER_MTOK
 
 
 @dataclass(frozen=True)
@@ -99,7 +109,7 @@ class Exclusion:
 class Observation:
     line: int
     ts: str
-    cost_usd: float
+    cost: float
     util: float
     bucket: int
 
@@ -129,22 +139,20 @@ class Estimate:
     loaded_events: int
     priced_events: int
     excluded_events: int
-    measured_cost_usd: float
+    measured_cost: float
     crossings: list[Crossing]
     interval: Interval | None
     exclusions: list[Exclusion]
 
     def to_json(self) -> dict[str, Any]:
-        interval_json = None if self.interval is None else self.interval.to_json()
-        full_quota_json = None
-        opus_cache_write_json = None
+        # The interval is already carried in NORMALIZED_COST_UNIT, so the reported
+        # per-tick and full-quota costs are the interval itself (×100 for the full
+        # window) — no separate unit projection. [LAW:one-source-of-truth]
+        cost_per_tick_json = None if self.interval is None else self.interval.to_json()
+        cost_full_quota_json = None
         if self.interval is not None:
             full = Interval(self.interval.lo * 100.0, self.interval.hi * 100.0)
-            full_quota_json = full.to_json()
-            opus_cache_write_json = {
-                "per_tick": tokens_from_usd_interval(self.interval, OPUS_CACHE_WRITE_USD_PER_MTOK).to_json(),
-                "full_quota": tokens_from_usd_interval(full, OPUS_CACHE_WRITE_USD_PER_MTOK).to_json(),
-            }
+            cost_full_quota_json = full.to_json()
         return {
             "schema_version": self.schema_version,
             "status": self.status,
@@ -155,19 +163,14 @@ class Estimate:
                 "priced": self.priced_events,
                 "excluded": self.excluded_events,
             },
-            "measured_cost_usd": self.measured_cost_usd,
+            "cost_unit": NORMALIZED_COST_UNIT,
+            "measured_cost": self.measured_cost,
             "crossing_count": len(self.crossings),
             "crossings": [c.to_json() for c in self.crossings],
-            "weighted_usd_per_tick": interval_json,
-            "weighted_usd_full_quota": full_quota_json,
-            "opus_cache_write_tokens": opus_cache_write_json,
+            "cost_per_tick": cost_per_tick_json,
+            "cost_full_quota": cost_full_quota_json,
             "exclusions": [e.to_json() for e in self.exclusions],
         }
-
-
-def tokens_from_usd_interval(interval: Interval, usd_per_mtok: float) -> Interval:
-    scale = 1_000_000.0 / usd_per_mtok
-    return Interval(interval.lo * scale, interval.hi * scale)
 
 
 def load_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[Exclusion]]:
@@ -190,7 +193,10 @@ def load_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[Exclusion]]:
     return rows, exclusions
 
 
-def request_cost_usd(model: str, usage: dict[str, Any]) -> float | None:
+def request_cost(model: str, usage: dict[str, Any]) -> float | None:
+    # Returns the event's cost in NORMALIZED_COST_UNIT, or None for an unpriceable
+    # model. The weighted token sum is rescaled once, here, so every downstream cost
+    # (measured total, crossings, interval) is already in the reported unit.
     pricing = MODEL_PRICING.get(model.strip())
     if pricing is None:
         return None
@@ -208,7 +214,8 @@ def request_cost_usd(model: str, usage: dict[str, Any]) -> float | None:
         + CACHE_WRITE_1H_MULTIPLIER * cache_1h
         + CACHE_READ_MULTIPLIER * cache_read
     )
-    return (pricing.input_per_mtok * weighted_input + pricing.output_per_mtok * output_tokens) / 1_000_000.0
+    weighted = (pricing.input_per_mtok * weighted_input + pricing.output_per_mtok * output_tokens) / 1_000_000.0
+    return weighted * NORMALIZED_COST_SCALE
 
 
 def number(value: Any) -> float:
@@ -255,7 +262,7 @@ def build_observations(
         if not isinstance(usage, dict):
             exclusions.append(Exclusion(line_num, "missing_usage"))
             continue
-        cost = request_cost_usd(model, usage)
+        cost = request_cost(model, usage)
         if cost is None:
             exclusions.append(Exclusion(line_num, "unknown_model", model))
             continue
@@ -275,7 +282,7 @@ def build_observations(
             Observation(
                 line=line_num,
                 ts=str(row.get("ts") or ""),
-                cost_usd=cost,
+                cost=cost,
                 util=util_float,
                 bucket=utilization_bucket(util_float),
             )
@@ -291,7 +298,7 @@ def build_crossings(observations: list[Observation]) -> tuple[list[Crossing], fl
     measured_cost = 0.0
     for obs in observations[1:]:
         cost_before = measured_cost
-        measured_cost += obs.cost_usd
+        measured_cost += obs.cost
         cost_after = measured_cost
         if obs.bucket > previous_bucket:
             crossed = obs.bucket - previous_bucket
@@ -350,14 +357,14 @@ def estimate_rows(
     status = "estimated" if interval is not None else "insufficient"
     reason = "" if interval is not None else (estimate_reason or crossing_reason)
     return Estimate(
-        schema_version=1,
+        schema_version=2,
         status=status,
         reason=reason,
         window=window,
         loaded_events=len(rows),
         priced_events=len(observations),
         excluded_events=len(exclusions),
-        measured_cost_usd=measured_cost,
+        measured_cost=measured_cost,
         crossings=crossings,
         interval=interval,
         exclusions=exclusions,

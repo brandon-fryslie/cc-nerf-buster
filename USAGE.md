@@ -39,8 +39,7 @@ When it exits, it prints:
 
 - The active org/upstream scope
 - The selected window's low / midpoint / high bounds
-- Weighted USD per 1% tick and full-window capacity
-- Opus cache-write token projections per 1% tick and full quota
+- Cost per 1% tick and full-window quota, in opus cache-write tokens
 
 Dry-runs exercise the artifact and estimator path without spending quota:
 
@@ -92,7 +91,7 @@ just build && just test && just vet         # build and verify the proxy itself
 
 ## Interpreting Token Counts
 
-`fresh-bounds.json` and `fresh-report.md` express capacity as weighted USD and token projections. For Opus the useful numbers are usually cache-write-equivalent tokens per 1% tick and full-window cache-write-equivalent tokens.
+`fresh-bounds.json` and `fresh-report.md` express capacity in opus cache-write tokens: cost per 1% tick and full-window quota, each as low / midpoint / high.
 
 ## Legacy Capacity Probe
 

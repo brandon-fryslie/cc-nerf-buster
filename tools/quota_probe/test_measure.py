@@ -10,16 +10,16 @@ from tools.quota_probe.estimator import Estimate, Interval
 from tools.quota_probe.measure import DriveConfig, drive, reject_unusable_active_events
 
 
-def _estimate_with_cost(measured_cost_usd: float) -> Estimate:
+def _estimate_with_cost(measured_cost: float) -> Estimate:
     return Estimate(
-        schema_version=1,
+        schema_version=2,
         status="estimated",
         reason="",
         window="5h",
         loaded_events=2,
         priced_events=2,
         excluded_events=0,
-        measured_cost_usd=measured_cost_usd,
+        measured_cost=measured_cost,
         crossings=[],
         interval=Interval(2.0, 3.0),
         exclusions=[],
@@ -54,7 +54,7 @@ def test_dry_run_drive_writes_replayable_artifacts(tmp_path):
     assert (tmp_path / "fresh-report.md").exists()
     saved = json.loads((tmp_path / "fresh-bounds.json").read_text())
     assert saved["status"] == "estimated"
-    assert saved["weighted_usd_per_tick"]["relative_width"] <= 0.20
+    assert saved["cost_per_tick"]["relative_width"] <= 0.20
 
 
 def test_build_prompt_emits_whole_blocks():
@@ -76,19 +76,19 @@ def test_fit_block_line_recovers_constants():
 
 
 def test_recalibrate_flags_cache_write_inflation():
-    # b=72 -> no-cache prediction is 72 * opus input price. recalibrate stays pure:
+    # b=72 -> no-cache prediction is 72 * opus input cost. recalibrate stays pure:
     # it returns the warning text, never prints it. [LAW:effects-at-boundaries]
     seed = measure.seed_actuator("claude-opus-4-7")
     samples = [(0, 25), (100, 25 + 100 * 72)]
-    predicted = 72 * measure.model_input_price_per_token("claude-opus-4-7")
+    predicted = 72 * measure.model_input_cost_per_token("claude-opus-4-7")
 
-    # observed usd/block well above predicted * 1.5 -> warning
+    # observed cost/block well above predicted * 1.5 -> warning
     inflated = predicted * 100 * 3.0  # total_blocks=100
     actuator, warning = measure.recalibrate(seed, samples, _estimate_with_cost(inflated), 100, "claude-opus-4-7")
     assert abs(actuator.tokens_per_block - 72) < 0.5
     assert warning is not None and "cache-write" in warning
 
-    # observed usd/block matching the prediction -> no warning
+    # observed cost/block matching the prediction -> no warning
     onprice = predicted * 100
     _, clean = measure.recalibrate(seed, samples, _estimate_with_cost(onprice), 100, "claude-opus-4-7")
     assert clean is None
@@ -136,16 +136,16 @@ def test_token_actuator_converges_and_tracks(tmp_path):
     assert min(bracket_widths[2:]) < bracket_widths[0] / 3.0
 
 
-def _estimate(measured_cost_usd, crossings, interval):
+def _estimate(measured_cost, crossings, interval):
     return Estimate(
-        schema_version=1,
+        schema_version=2,
         status="estimated",
         reason="",
         window="5h",
         loaded_events=len(crossings) + 2,
         priced_events=len(crossings) + 2,
         excluded_events=0,
-        measured_cost_usd=measured_cost_usd,
+        measured_cost=measured_cost,
         crossings=crossings,
         interval=interval,
         exclusions=[],
@@ -176,10 +176,10 @@ def test_sizer_bulk_dominates_far_below_window():
     crossings = [Crossing(k=10, cost_before=0.0, cost_after=0.1, line=5)]
     # now far below a narrow window [10.0, 10.6]; bulk = 0.9*(10.0-0.1) beats bisect = (10.6-0.1)/2.
     est = _estimate(0.1, crossings=crossings, interval=Interval(10.0, 10.5))
-    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, usd_per_block=72.0 * 5e-6)
+    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, cost_per_block=72.0 * 5e-6)
     target = measure.target_input_tokens_for_estimate(est, actuator)
-    expected_usd = measure.BULK_UNDERSHOOT * (10.0 - 0.1)
-    expected = 25.0 + (expected_usd / actuator.usd_per_block) * 72.0
+    expected_cost = measure.BULK_UNDERSHOOT * (10.0 - 0.1)
+    expected = 25.0 + (expected_cost / actuator.cost_per_block) * 72.0
     assert target == pytest.approx(min(measure.MAX_PROMPT_TOKENS, expected), rel=1e-6)
 
 
@@ -188,10 +188,10 @@ def test_sizer_bisect_dominates_inside_window():
     crossings = [Crossing(k=10, cost_before=4.0, cost_after=4.2, line=5)]
     # now is inside the window [4.0+2.0, 4.2+2.5] = [6.0, 6.7]; bulk goes negative, bisect wins.
     est = _estimate(6.3, crossings=crossings, interval=Interval(2.0, 2.5))
-    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, usd_per_block=72.0 * 5e-6)
+    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, cost_per_block=72.0 * 5e-6)
     target = measure.target_input_tokens_for_estimate(est, actuator)
-    expected_usd = (6.7 - 6.3) / 2.0
-    expected = 25.0 + (expected_usd / actuator.usd_per_block) * 72.0
+    expected_cost = (6.7 - 6.3) / 2.0
+    expected = 25.0 + (expected_cost / actuator.cost_per_block) * 72.0
     assert target == pytest.approx(min(measure.MAX_PROMPT_TOKENS, expected), rel=1e-6)
 
 
@@ -201,7 +201,7 @@ def test_sizer_floors_at_min_prompt_tokens_past_window():
     # now beyond window.hi (prediction undershot): both terms <=0, so the sizer floors to a
     # minimal real probe that still advances rather than stalling. [LAW:no-silent-failure]
     est = _estimate(99.0, crossings=crossings, interval=Interval(2.0, 2.5))
-    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, usd_per_block=72.0 * 5e-6)
+    actuator = measure.Actuator(header_tokens=25.0, tokens_per_block=72.0, cost_per_block=72.0 * 5e-6)
     assert measure.target_input_tokens_for_estimate(est, actuator) == measure.MIN_PROMPT_TOKENS
 
 
@@ -228,7 +228,7 @@ def test_active_run_rejects_unusable_events():
         loaded_events=3,
         priced_events=0,
         excluded_events=3,
-        measured_cost_usd=0.0,
+        measured_cost=0.0,
         crossings=[],
         interval=None,
         exclusions=[],

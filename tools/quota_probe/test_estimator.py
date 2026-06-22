@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from tools.quota_probe.estimator import (
+    NORMALIZED_COST_SCALE,
     Crossing,
     estimate_interval,
     estimate_rows,
-    request_cost_usd,
+    request_cost,
 )
 
 
@@ -42,9 +43,9 @@ def test_request_cost_uses_cache_ttl_buckets():
         "cache_creation_1h_input_tokens": 100,
         "cache_read_input_tokens": 1000,
     }
-    cost = request_cost_usd("claude-opus-4-7", usage)
+    cost = request_cost("claude-opus-4-7", usage)
     weighted_input = 100 + 1.25 * 200 + 2.0 * 100 + 0.10 * 1000
-    assert cost == ((5.0 * weighted_input) + (25.0 * 10)) / 1_000_000
+    assert cost == ((5.0 * weighted_input) + (25.0 * 10)) / 1_000_000 * NORMALIZED_COST_SCALE
 
 
 def test_unknown_model_is_excluded():
@@ -70,7 +71,8 @@ def test_single_crossing_is_insufficient():
 
 
 def test_pairwise_interval_narrows_capacity():
-    # Opus 1h cache-write cost is $10/MTok, so 200k tokens = $2.00.
+    # The cost unit IS opus cache-write tokens, so 200k cache-write tokens per tick
+    # reads back as a per-tick cost of exactly 200,000.
     rows = [
         event(1, 10),
         event(200_000, 11),
@@ -81,10 +83,10 @@ def test_pairwise_interval_narrows_capacity():
     result = estimate_rows(rows, window="5h")
     assert result.status == "estimated"
     assert result.interval is not None
-    assert result.interval.lo <= 2.0 <= result.interval.hi
-    assert result.interval.mid == 2.0
+    assert result.interval.lo <= 200_000.0 <= result.interval.hi
+    assert result.interval.mid == 200_000.0
     assert result.interval.width < max(c.width for c in result.crossings)
-    assert round(result.to_json()["opus_cache_write_tokens"]["per_tick"]["midpoint"]) == 200_000
+    assert round(result.to_json()["cost_per_tick"]["midpoint"]) == 200_000
 
 
 def test_multi_tick_event_does_not_pair_with_itself():
@@ -129,14 +131,14 @@ def test_non_measurement_rows_are_skipped_not_aborted():
 def test_errored_requests_are_not_counted():
     # A non-200 response that still carries usage must never enter the total.
     # Placed between two crossings so that, if its cost were counted, it would
-    # shift the per-tick estimate far from the true $2.00/tick.
-    bad = event(10_000_000, 11)  # ~$100 of cache-write if it were counted
+    # shift the per-tick estimate far from the true 200,000/tick.
+    bad = event(10_000_000, 11)  # ~10,000,000 cost units of cache-write if it were counted
     bad["status"] = 500
     rows = [event(1, 10), event(200_000, 11), bad, event(200_000, 12)]
     result = estimate_rows(rows, window="5h")
     assert result.status == "estimated"
     assert result.interval is not None
-    assert result.interval.mid == 2.0
+    assert result.interval.mid == 200_000.0
     assert any(e.reason == "request_not_served" for e in result.exclusions)
 
 
