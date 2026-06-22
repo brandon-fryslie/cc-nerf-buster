@@ -80,6 +80,10 @@ class DriveConfig:
     target_relative_width: float
     max_iters: int
     dry_run: bool
+    # When set, the run stops after observing this many quota-tick crossings
+    # instead of when the interval reaches target_relative_width. One field
+    # carries which precision target governs. [LAW:dataflow-not-control-flow]
+    target_ticks: int | None = None
     claude_timeout_seconds: int = DEFAULT_CLAUDE_TIMEOUT_SECONDS
 
     def to_json(self) -> dict[str, Any]:
@@ -563,6 +567,15 @@ def reject_unusable_active_events(estimate: Estimate) -> None:
         )
 
 
+def stop_reached(estimate: Estimate, cfg: DriveConfig) -> bool:
+    # One stop predicate; which threshold governs is selected by whether a
+    # tick target carries a value, not by a separate run mode.
+    # [LAW:dataflow-not-control-flow] [LAW:no-mode-explosion]
+    if cfg.target_ticks is not None:
+        return len(estimate.crossings) >= cfg.target_ticks
+    return estimate.interval is not None and estimate.interval.relative_width <= cfg.target_relative_width
+
+
 def drive(cfg: DriveConfig) -> Estimate:
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
     (cfg.run_dir / "prompts").mkdir(exist_ok=True)
@@ -642,7 +655,7 @@ def drive(cfg: DriveConfig) -> Estimate:
             "usd_per_block": actuator.usd_per_block,
             "relative_width": None if estimate.interval is None else estimate.interval.relative_width,
         })
-        if estimate.interval is not None and estimate.interval.relative_width <= cfg.target_relative_width:
+        if stop_reached(estimate, cfg):
             return estimate
     return estimate
 
@@ -661,6 +674,13 @@ def parse_args() -> argparse.Namespace:
     drive_cmd.add_argument("--window", choices=("5h", "7d"), required=True)
     drive_cmd.add_argument("--model", default=DEFAULT_MODEL)
     drive_cmd.add_argument("--target-relative-width", type=float, default=0.03)
+    drive_cmd.add_argument(
+        "--target-ticks",
+        type=int,
+        default=None,
+        help="stop after observing this many quota-tick crossings instead of a target width; "
+        "defaults to the TARGET_5H_TICKS / TARGET_7D_TICKS env var for the chosen window",
+    )
     drive_cmd.add_argument("--max-iters", type=int, default=80)
     drive_cmd.add_argument("--claude-timeout-seconds", type=int, default=DEFAULT_CLAUDE_TIMEOUT_SECONDS)
     drive_cmd.add_argument("--dry-run", action="store_true")
@@ -677,6 +697,13 @@ def main() -> None:
         return
     if args.cmd == "drive":
         run_dir = args.run_dir or default_run_dir(args.dry_run)
+        # The window→env-var mapping lives only here, where the window is known,
+        # so callers (justfile, with_proxy.sh) never re-derive it. [LAW:single-enforcer]
+        target_ticks = args.target_ticks
+        if target_ticks is None:
+            env_ticks = os.environ.get(f"TARGET_{args.window.upper()}_TICKS")
+            if env_ticks is not None:
+                target_ticks = int(env_ticks)
         cfg = DriveConfig(
             window=args.window,
             run_dir=run_dir,
@@ -684,6 +711,7 @@ def main() -> None:
             target_relative_width=args.target_relative_width,
             max_iters=args.max_iters,
             dry_run=args.dry_run,
+            target_ticks=target_ticks,
             claude_timeout_seconds=args.claude_timeout_seconds,
         )
         estimate = drive(cfg)
